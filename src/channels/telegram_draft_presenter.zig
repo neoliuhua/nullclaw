@@ -69,6 +69,11 @@ fn shouldFlushDraft(state: *const DraftState, now_ms: i64) bool {
     return flushDeltaReached(state) or flushIntervalElapsed(state, now_ms);
 }
 
+fn hasPendingVisibleDraft(state: *const DraftState) bool {
+    if (state.buffer.items.len <= state.last_flush_len) return false;
+    return hasVisibleDraftText(state.buffer.items[state.last_flush_len..]);
+}
+
 fn snapshotDraftText(allocator: std.mem.Allocator, state: *const DraftState) ![]u8 {
     return allocator.dupe(u8, state.buffer.items);
 }
@@ -155,6 +160,34 @@ pub fn appendDraftChunk(
     return .{
         .draft_id = state.draft_id,
         .text = text,
+        .started_at_ms = state.started_at_ms,
+    };
+}
+
+pub fn heartbeatDraft(
+    allocator: std.mem.Allocator,
+    state: *DraftState,
+    now_ms: i64,
+) !?DraftFlush {
+    if (draftSuppressed(state, now_ms)) return null;
+    if (millisSinceLastFlush(state, now_ms) < DRAFT_HEARTBEAT_INTERVAL_MS) return null;
+
+    if (hasPendingVisibleDraft(state)) {
+        const text = try snapshotDraftText(allocator, state);
+        markDraftFlushed(state, now_ms);
+        return .{
+            .draft_id = state.draft_id,
+            .text = text,
+            .started_at_ms = state.started_at_ms,
+        };
+    }
+
+    if (hasVisibleDraftText(state.buffer.items)) return null;
+
+    state.last_flush_time = now_ms;
+    return .{
+        .draft_id = state.draft_id,
+        .text = try buildHeartbeatText(allocator, state.started_at_ms, now_ms),
         .started_at_ms = state.started_at_ms,
     };
 }
@@ -256,4 +289,60 @@ test "buildHeartbeatText emits visible progress status" {
 
     try std.testing.expect(hasVisibleDraftText(heartbeat));
     try std.testing.expect(std.mem.indexOf(u8, heartbeat, "Interim result is still being prepared.") != null);
+}
+
+test "heartbeatDraft flushes pending visible text after interval" {
+    var draft: DraftState = .{
+        .draft_id = 21,
+        .started_at_ms = 1_000,
+        .last_flush_time = 1_000,
+    };
+    defer draft.deinit(std.testing.allocator);
+    try draft.buffer.appendSlice(std.testing.allocator, "hello");
+
+    const flush = (try heartbeatDraft(std.testing.allocator, &draft, 1_000 + DRAFT_HEARTBEAT_INTERVAL_MS + 1)) orelse
+        return error.TestUnexpectedResult;
+    defer {
+        var tmp = flush;
+        tmp.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expectEqual(@as(u64, 21), flush.draft_id);
+    try std.testing.expectEqualStrings("hello", flush.text);
+    try std.testing.expectEqual(@as(usize, 5), draft.last_flush_len);
+    try std.testing.expectEqual(@as(i64, 1_000 + DRAFT_HEARTBEAT_INTERVAL_MS + 1), draft.last_flush_time);
+}
+
+test "heartbeatDraft stays quiet when visible text was already flushed" {
+    var draft: DraftState = .{
+        .draft_id = 22,
+        .started_at_ms = 1_000,
+        .last_flush_time = 1_000,
+        .last_flush_len = 5,
+    };
+    defer draft.deinit(std.testing.allocator);
+    try draft.buffer.appendSlice(std.testing.allocator, "hello");
+
+    try std.testing.expect((try heartbeatDraft(std.testing.allocator, &draft, 1_000 + DRAFT_HEARTBEAT_INTERVAL_MS + 1)) == null);
+}
+
+test "heartbeatDraft emits heartbeat when no visible draft is available" {
+    var draft: DraftState = .{
+        .draft_id = 23,
+        .started_at_ms = 5_000,
+        .last_flush_time = 5_000,
+    };
+    defer draft.deinit(std.testing.allocator);
+    try draft.buffer.appendSlice(std.testing.allocator, " \n\t");
+
+    const flush = (try heartbeatDraft(std.testing.allocator, &draft, 5_000 + DRAFT_HEARTBEAT_INTERVAL_MS + 1)) orelse
+        return error.TestUnexpectedResult;
+    defer {
+        var tmp = flush;
+        tmp.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, flush.text, "Interim result is still being prepared.") != null);
+    try std.testing.expectEqual(@as(usize, 0), draft.last_flush_len);
+    try std.testing.expectEqual(@as(i64, 5_000 + DRAFT_HEARTBEAT_INTERVAL_MS + 1), draft.last_flush_time);
 }

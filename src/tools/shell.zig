@@ -8,6 +8,7 @@ const JsonObjectMap = root.JsonObjectMap;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 const json_miniparse = @import("../json_miniparse.zig");
+const command_summary = @import("../command_summary.zig");
 const UNAVAILABLE_WORKSPACE_SENTINEL = "/__nullclaw_workspace_unavailable__";
 const log = std.log.scoped(.shell);
 
@@ -145,7 +146,12 @@ pub const ShellTool = struct {
             _ = pol.validateCommandExecution(command, false) catch |err| {
                 return switch (err) {
                     error.CommandNotAllowed => blk: {
-                        log.warn("command blocked by security policy: {s}", .{command});
+                        const summary = command_summary.summarizeBlockedCommand(command);
+                        log.warn("command blocked by security policy: head={s} bytes={d} assignments={d}", .{
+                            summary.head,
+                            summary.byte_len,
+                            summary.assignment_count,
+                        });
                         break :blk ToolResult.fail("Command not allowed by security policy");
                     },
                     error.HighRiskBlocked => ToolResult.fail("High-risk command blocked by security policy"),

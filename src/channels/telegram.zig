@@ -2467,32 +2467,23 @@ pub const TelegramChannel = struct {
         if (builtin.is_test or !self.streaming_enabled or chat_id.len == 0) return;
 
         const now_ms = std.time.milliTimestamp();
-        var draft_id: u64 = 0;
-        var started_at_ms: i64 = 0;
-        var heartbeat_text: ?[]u8 = null;
-        defer if (heartbeat_text) |text| self.allocator.free(text);
+        var pending_flush: ?telegram_draft_presenter.DraftFlush = null;
+        defer if (pending_flush) |*flush| flush.deinit(self.allocator);
 
         {
             self.draft_mu.lock();
             defer self.draft_mu.unlock();
 
             const state = self.ensureDraftStateLocked(chat_id, now_ms) catch return;
-            if (state.suppress_until_ms > now_ms) return;
-            if (state.buffer.items.len > 0 and telegram_draft_presenter.hasVisibleDraftText(state.buffer.items)) return;
-            if ((now_ms - state.last_flush_time) < telegram_draft_presenter.DRAFT_HEARTBEAT_INTERVAL_MS) return;
-
-            heartbeat_text = telegram_draft_presenter.buildHeartbeatText(
+            pending_flush = telegram_draft_presenter.heartbeatDraft(
                 self.allocator,
-                state.started_at_ms,
+                state,
                 now_ms,
             ) catch return;
-            draft_id = state.draft_id;
-            started_at_ms = state.started_at_ms;
-            state.last_flush_time = now_ms;
         }
 
-        if (heartbeat_text) |text| {
-            self.sendDraft(chat_id, draft_id, text, started_at_ms);
+        if (pending_flush) |flush| {
+            self.sendDraft(chat_id, flush.draft_id, flush.text, flush.started_at_ms);
         }
     }
 

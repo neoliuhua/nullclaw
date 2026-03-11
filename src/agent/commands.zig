@@ -15,6 +15,7 @@ const max_tokens_resolver = @import("max_tokens.zig");
 const control_plane = @import("../control_plane.zig");
 const provider_names = @import("../provider_names.zig");
 const version = @import("../version.zig");
+const command_summary = @import("../command_summary.zig");
 const log = std.log.scoped(.agent);
 
 const SlashCommand = control_plane.SlashCommand;
@@ -1701,7 +1702,12 @@ fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool)
     if (self.exec_security == .allowlist) {
         if (self.policy) |pol| {
             if (!pol.isCommandAllowed(command)) {
-                log.warn("exec blocked by allowlist policy: {s}", .{command});
+                const summary = command_summary.summarizeBlockedCommand(command);
+                log.warn("exec blocked by allowlist policy: head={s} bytes={d} assignments={d}", .{
+                    summary.head,
+                    summary.byte_len,
+                    summary.assignment_count,
+                });
                 return try self.allocator.dupe(u8, "Exec blocked by allowlist policy");
             }
         }
@@ -2571,7 +2577,12 @@ pub fn execBlockMessage(self: anytype, args: std.json.ObjectMap) ?[]const u8 {
                 const command = v.string;
                 if (self.policy) |pol| {
                     if (!pol.isCommandAllowed(command)) {
-                        log.warn("tool exec blocked by allowlist policy: {s}", .{command});
+                        const summary = command_summary.summarizeBlockedCommand(command);
+                        log.warn("tool exec blocked by allowlist policy: head={s} bytes={d} assignments={d}", .{
+                            summary.head,
+                            summary.byte_len,
+                            summary.assignment_count,
+                        });
                         return "Exec blocked by allowlist policy";
                     }
                 }
