@@ -23,6 +23,7 @@ pub const ChannelId = enum {
     maixcam,
     nostr,
     web,
+    max,
 };
 
 pub const ChannelMeta = struct {
@@ -53,7 +54,7 @@ pub const known_channels = [_]ChannelMeta{
     .{ .id = .whatsapp, .key = "whatsapp", .label = "WhatsApp", .configured_message = "WhatsApp configured", .listener_mode = .webhook_only },
     .{ .id = .irc, .key = "irc", .label = "IRC", .configured_message = "IRC configured", .listener_mode = .gateway_loop },
     .{ .id = .lark, .key = "lark", .label = "Lark", .configured_message = "Lark configured", .listener_mode = .webhook_only },
-    .{ .id = .dingtalk, .key = "dingtalk", .label = "DingTalk", .configured_message = "DingTalk configured", .listener_mode = .send_only },
+    .{ .id = .dingtalk, .key = "dingtalk", .label = "DingTalk", .configured_message = "DingTalk configured", .listener_mode = .gateway_loop },
     .{ .id = .signal, .key = "signal", .label = "Signal", .configured_message = "Signal configured", .listener_mode = .polling },
     .{ .id = .email, .key = "email", .label = "Email", .configured_message = "Email configured", .listener_mode = .send_only },
     .{ .id = .line, .key = "line", .label = "Line", .configured_message = "Line configured", .listener_mode = .webhook_only },
@@ -62,6 +63,7 @@ pub const known_channels = [_]ChannelMeta{
     .{ .id = .maixcam, .key = "maixcam", .label = "MaixCam", .configured_message = "MaixCam configured", .listener_mode = .send_only },
     .{ .id = .nostr, .key = "nostr", .label = "Nostr", .configured_message = "Nostr configured", .listener_mode = .gateway_loop },
     .{ .id = .web, .key = "web", .label = "Web", .configured_message = "Web configured", .listener_mode = .gateway_loop },
+    .{ .id = .max, .key = "max", .label = "Max", .configured_message = "Max configured", .listener_mode = .polling },
 };
 
 pub fn isBuildEnabled(channel_id: ChannelId) bool {
@@ -86,6 +88,7 @@ pub fn isBuildEnabled(channel_id: ChannelId) bool {
         .maixcam => build_options.enable_channel_maixcam,
         .nostr => build_options.enable_channel_nostr,
         .web => build_options.enable_channel_web,
+        .max => build_options.enable_channel_max,
     };
 }
 
@@ -110,6 +113,7 @@ pub fn isBuildEnabledByKey(comptime key: []const u8) bool {
     if (comptime std.mem.eql(u8, key, "maixcam")) return build_options.enable_channel_maixcam;
     if (comptime std.mem.eql(u8, key, "nostr")) return build_options.enable_channel_nostr;
     if (comptime std.mem.eql(u8, key, "web")) return build_options.enable_channel_web;
+    if (comptime std.mem.eql(u8, key, "max")) return build_options.enable_channel_max;
     return true;
 }
 
@@ -135,6 +139,7 @@ pub fn configuredCount(cfg: *const Config, channel_id: ChannelId) usize {
         .maixcam => cfg.channels.maixcam.len,
         .nostr => if (cfg.channels.nostr != null) 1 else 0,
         .web => cfg.channels.web.len,
+        .max => cfg.channels.max.len,
     };
 }
 

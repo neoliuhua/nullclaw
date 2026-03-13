@@ -6,12 +6,13 @@
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark, /qq, /slack/events
+//!   - Endpoints: /health, /ready, /pair, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /qq, /max, /slack/events
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
 const std = @import("std");
 const build_options = @import("build_options");
+const daemon = @import("daemon.zig");
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
@@ -29,6 +30,8 @@ const security = @import("security/policy.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
+const a2a = @import("a2a.zig");
+const thread_stacks = @import("thread_stacks.zig");
 
 /// Maximum request body size (64KB) — prevents memory exhaustion.
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -37,6 +40,7 @@ const MAX_HTTP_REQUEST_SIZE: usize = MAX_HEADER_SIZE + MAX_BODY_SIZE;
 
 /// Request timeout (30s) — prevents slow-loris attacks.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+const ACCEPT_POLL_INTERVAL_MS: u64 = 100;
 
 /// Sliding window for rate limiting (60s).
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
@@ -907,6 +911,67 @@ fn selectTelegramConfig(
     return &cfg.channels.telegram[0];
 }
 
+fn findMaxConfigByAccountId(cfg: *const Config, account_id: []const u8) ?*const config_types.MaxConfig {
+    for (cfg.channels.max) |*max_cfg| {
+        if (std.ascii.eqlIgnoreCase(max_cfg.account_id, account_id)) return max_cfg;
+    }
+    return null;
+}
+
+fn findMaxConfigByWebhookSecret(cfg: *const Config, secret: []const u8) ?*const config_types.MaxConfig {
+    for (cfg.channels.max) |*max_cfg| {
+        if (max_cfg.webhook_secret) |configured_secret| {
+            if (configured_secret.len > 0 and std.mem.eql(u8, configured_secret, secret)) return max_cfg;
+        }
+    }
+    return null;
+}
+
+fn countMaxWebhookAccounts(cfg: *const Config) usize {
+    var count: usize = 0;
+    for (cfg.channels.max) |max_cfg| {
+        if (max_cfg.mode == .webhook) count += 1;
+    }
+    return count;
+}
+
+fn selectMaxConfig(
+    cfg_opt: ?*const Config,
+    target: []const u8,
+    secret_header: ?[]const u8,
+) ?*const config_types.MaxConfig {
+    if (!build_options.enable_channel_max) return null;
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.max.len == 0) return null;
+
+    if (parseQueryParam(target, "account_id")) |account_id| {
+        return findMaxConfigByAccountId(cfg, account_id);
+    }
+    if (parseQueryParam(target, "account")) |account_id| {
+        return findMaxConfigByAccountId(cfg, account_id);
+    }
+
+    if (secret_header) |raw_secret| {
+        const secret = std.mem.trim(u8, raw_secret, " \t\r\n");
+        if (secret.len > 0) {
+            return findMaxConfigByWebhookSecret(cfg, secret);
+        }
+    }
+
+    const webhook_count = countMaxWebhookAccounts(cfg);
+    if (webhook_count == 1) {
+        for (cfg.channels.max) |*max_cfg| {
+            if (max_cfg.mode == .webhook) return max_cfg;
+        }
+    }
+
+    if (cfg.channels.max.len == 1) {
+        return &cfg.channels.max[0];
+    }
+
+    return null;
+}
+
 fn hasLineSecrets(cfg: *const Config) bool {
     if (!build_options.enable_channel_line) return false;
     for (cfg.channels.line) |line_cfg| {
@@ -1332,15 +1397,33 @@ fn telegramSenderAllowed(allocator: std.mem.Allocator, allow_from: []const []con
 fn telegramSessionKeyRouted(
     allocator: std.mem.Allocator,
     fallback_buf: []u8,
-    chat_id: i64,
     body: []const u8,
     cfg_opt: ?*const Config,
     account_id: []const u8,
 ) []const u8 {
-    const fallback = std.fmt.bufPrint(fallback_buf, "telegram:{d}", .{chat_id}) catch "telegram:0";
+    const target = telegramWebhookTarget(allocator, body) orelse return "telegram:0";
+    const fallback = telegramFallbackSessionKey(fallback_buf, target.chat_id, target.message_thread_id);
     var peer_buf: [64]u8 = undefined;
-    const peer_id = std.fmt.bufPrint(&peer_buf, "{d}", .{chat_id}) catch return fallback;
-    const peer_kind: agent_routing.ChatType = if (telegramChatIsGroup(allocator, body)) .group else .direct;
+    const peer_id = std.fmt.bufPrint(&peer_buf, "{d}", .{target.chat_id}) catch return fallback;
+    const peer_kind: agent_routing.ChatType = if (target.is_group) .group else .direct;
+
+    if (cfg_opt) |cfg| {
+        if (target.is_group and target.message_thread_id != null) {
+            const thread_id = target.message_thread_id.?;
+            const topic_peer_id = std.fmt.allocPrint(allocator, "{s}:thread:{d}", .{ peer_id, thread_id }) catch return fallback;
+            defer allocator.free(topic_peer_id);
+
+            const route = agent_routing.resolveRouteWithSession(allocator, .{
+                .channel = "telegram",
+                .account_id = account_id,
+                .peer = .{ .kind = peer_kind, .id = topic_peer_id },
+                .parent_peer = .{ .kind = peer_kind, .id = peer_id },
+            }, cfg.agent_bindings, cfg.agents, cfg.session) catch return fallback;
+            allocator.free(route.main_session_key);
+            return route.session_key;
+        }
+    }
+
     return resolveRouteSessionKey(
         allocator,
         cfg_opt,
@@ -1351,23 +1434,99 @@ fn telegramSessionKeyRouted(
     );
 }
 
-fn telegramChatId(allocator: std.mem.Allocator, body: []const u8) ?i64 {
+const TelegramWebhookTarget = struct {
+    chat_id: i64,
+    is_group: bool,
+    message_thread_id: ?i64 = null,
+};
+
+fn telegramMessageValue(root: std.json.Value) ?std.json.Value {
+    if (root != .object) return null;
+    return root.object.get("message") orelse root.object.get("edited_message");
+}
+
+fn telegramMessageThreadId(message: std.json.Value) ?i64 {
+    if (message != .object) return null;
+
+    if (message.object.get("message_thread_id")) |thread_id_val| {
+        if (thread_id_val == .integer and thread_id_val.integer > 0) {
+            return thread_id_val.integer;
+        }
+    }
+
+    const is_topic_message = blk: {
+        const field = message.object.get("is_topic_message") orelse break :blk false;
+        break :blk field == .bool and field.bool;
+    };
+    if (!is_topic_message) return null;
+
+    const reply_to_message = message.object.get("reply_to_message") orelse return null;
+    if (reply_to_message != .object) return null;
+
+    const reply_message_id = reply_to_message.object.get("message_id") orelse return null;
+    if (reply_message_id != .integer or reply_message_id.integer <= 0) return null;
+    return reply_message_id.integer;
+}
+
+fn telegramWebhookTarget(allocator: std.mem.Allocator, body: []const u8) ?TelegramWebhookTarget {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
-        return jsonIntField(body, "chat_id");
+        if (jsonIntField(body, "chat_id")) |chat_id| {
+            return .{
+                .chat_id = chat_id,
+                .is_group = false,
+            };
+        }
+        return null;
     };
     defer parsed.deinit();
-    if (parsed.value != .object) return jsonIntField(body, "chat_id");
 
-    const msg_obj = parsed.value.object.get("message") orelse
-        parsed.value.object.get("edited_message") orelse return jsonIntField(body, "chat_id");
-    if (msg_obj != .object) return jsonIntField(body, "chat_id");
+    const message = telegramMessageValue(parsed.value) orelse {
+        if (jsonIntField(body, "chat_id")) |chat_id| {
+            return .{
+                .chat_id = chat_id,
+                .is_group = false,
+            };
+        }
+        return null;
+    };
+    if (message != .object) return null;
 
-    const chat_obj = msg_obj.object.get("chat") orelse return jsonIntField(body, "chat_id");
-    if (chat_obj != .object) return jsonIntField(body, "chat_id");
+    const chat = message.object.get("chat") orelse return null;
+    if (chat != .object) return null;
 
-    const id_val = chat_obj.object.get("id") orelse return jsonIntField(body, "chat_id");
-    if (id_val != .integer) return jsonIntField(body, "chat_id");
-    return id_val.integer;
+    const id_val = chat.object.get("id") orelse return null;
+    if (id_val != .integer) return null;
+
+    const chat_type = blk: {
+        const field = chat.object.get("type") orelse break :blk "";
+        break :blk if (field == .string) field.string else "";
+    };
+
+    return .{
+        .chat_id = id_val.integer,
+        .is_group = std.mem.eql(u8, chat_type, "group") or
+            std.mem.eql(u8, chat_type, "supergroup") or
+            std.mem.eql(u8, chat_type, "channel"),
+        .message_thread_id = telegramMessageThreadId(message),
+    };
+}
+
+fn telegramFallbackSessionKey(fallback_buf: []u8, chat_id: i64, message_thread_id: ?i64) []const u8 {
+    if (message_thread_id) |thread_id| {
+        return std.fmt.bufPrint(fallback_buf, "telegram:{d}:thread:{d}", .{ chat_id, thread_id }) catch "telegram:0";
+    }
+    return std.fmt.bufPrint(fallback_buf, "telegram:{d}", .{chat_id}) catch "telegram:0";
+}
+
+fn telegramChatTargetAlloc(allocator: std.mem.Allocator, chat_id: i64, message_thread_id: ?i64) ![]u8 {
+    if (message_thread_id) |thread_id| {
+        return std.fmt.allocPrint(allocator, "{d}#topic:{d}", .{ chat_id, thread_id });
+    }
+    return std.fmt.allocPrint(allocator, "{d}", .{chat_id});
+}
+
+fn telegramChatId(allocator: std.mem.Allocator, body: []const u8) ?i64 {
+    return if (telegramWebhookTarget(allocator, body)) |target| target.chat_id else jsonIntField(body, "chat_id");
 }
 
 fn telegramSenderIdentity(
@@ -1456,6 +1615,34 @@ fn larkSessionKeyRouted(
         "lark",
         account_id,
         .{ .kind = peer_kind, .id = msg.sender },
+        fallback,
+    );
+}
+
+fn maxSessionKey(buf: []u8, account_id: []const u8, sender: []const u8, reply_target: []const u8, is_group: bool) []const u8 {
+    if (is_group) {
+        return std.fmt.bufPrint(buf, "max:{s}:chat:{s}", .{ account_id, reply_target }) catch "max:default";
+    }
+    return std.fmt.bufPrint(buf, "max:{s}:{s}", .{ account_id, sender }) catch "max:default";
+}
+
+fn maxSessionKeyRouted(
+    allocator: std.mem.Allocator,
+    fallback_buf: []u8,
+    sender: []const u8,
+    reply_target: []const u8,
+    is_group: bool,
+    cfg_opt: ?*const Config,
+    account_id: []const u8,
+) []const u8 {
+    const fallback = maxSessionKey(fallback_buf, account_id, sender, reply_target, is_group);
+    const peer_id = if (is_group) reply_target else sender;
+    return resolveRouteSessionKey(
+        allocator,
+        cfg_opt,
+        "max",
+        account_id,
+        .{ .kind = if (is_group) .group else .direct, .id = peer_id },
         fallback,
     );
 }
@@ -1595,7 +1782,13 @@ pub fn processIncomingMessage(allocator: std.mem.Allocator, message: []const u8)
 }
 
 /// Send a reply to a Telegram chat using the Bot API.
-pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, chat_id: i64, text: []const u8) !void {
+pub fn sendTelegramReply(
+    allocator: std.mem.Allocator,
+    bot_token: []const u8,
+    chat_id: i64,
+    message_thread_id: ?i64,
+    text: []const u8,
+) !void {
     // Build the curl command to call the Telegram API
     const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{bot_token});
     defer allocator.free(url);
@@ -1615,7 +1808,11 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
             else => try w.writeByte(c),
         }
     }
-    try w.writeAll("\"}");
+    try w.writeAll("\"");
+    if (message_thread_id) |thread_id| {
+        try w.print(",\"message_thread_id\":{d}", .{thread_id});
+    }
+    try w.writeAll("}");
 
     const body = body_buf.items;
 
@@ -1683,6 +1880,7 @@ const webhook_route_descriptors = [_]WebhookRouteDescriptor{
     .{ .path = "/line", .handler = handleLineWebhookRoute },
     .{ .path = "/lark", .handler = handleLarkWebhookRoute },
     .{ .path = "/qq", .handler = handleQqWebhookRoute },
+    .{ .path = "/max", .handler = handleMaxWebhookRoute },
 };
 
 fn findWebhookRouteDescriptor(path: []const u8) ?*const WebhookRouteDescriptor {
@@ -1724,47 +1922,63 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
         }
 
         const msg_text = jsonStringField(b, "text");
-        const chat_id = telegramChatId(ctx.req_allocator, b);
+        const telegram_target = telegramWebhookTarget(ctx.req_allocator, b);
+        const chat_id = if (telegram_target) |target| target.chat_id else telegramChatId(ctx.req_allocator, b);
         const tg_authorized = telegramSenderAllowed(ctx.req_allocator, tg_allow_from, b);
         if (!tg_authorized) {
             ctx.response_body = "{\"status\":\"unauthorized\"}";
             return;
         }
 
-        if (msg_text != null and chat_id != null) {
+        if (msg_text != null and telegram_target != null and chat_id != null) {
             var sender_buf: [32]u8 = undefined;
             const sender = telegramSenderIdentity(ctx.req_allocator, b, &sender_buf);
             var cid_buf: [32]u8 = undefined;
             const cid_str = std.fmt.bufPrint(&cid_buf, "{d}", .{chat_id.?}) catch "0";
-            const is_group = telegramChatIsGroup(ctx.req_allocator, b);
+            const is_group = telegram_target.?.is_group;
+            const thread_id = telegram_target.?.message_thread_id;
             const peer_kind = if (is_group) "group" else "direct";
+            const chat_target = telegramChatTargetAlloc(ctx.req_allocator, chat_id.?, thread_id) catch {
+                ctx.response_status = "500 Internal Server Error";
+                ctx.response_body = "{\"error\":\"failed to allocate telegram target\"}";
+                return;
+            };
+            defer ctx.req_allocator.free(chat_target);
 
             if (ctx.state.event_bus) |eb| {
-                var meta_buf: [320]u8 = undefined;
-                const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
-                    tg_account_id,
-                    peer_kind,
-                    cid_str,
-                }) catch null;
+                var meta_buf: [384]u8 = undefined;
+                const meta = if (thread_id) |tid|
+                    std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\",\"thread_id\":\"{d}\"}}", .{
+                        tg_account_id,
+                        peer_kind,
+                        cid_str,
+                        tid,
+                    }) catch null
+                else
+                    std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
+                        tg_account_id,
+                        peer_kind,
+                        cid_str,
+                    }) catch null;
                 var kb: [64]u8 = undefined;
                 const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
-                const sk = telegramSessionKeyRouted(ctx.req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
-                _ = publishToBus(eb, ctx.state.allocator, "telegram", sender, cid_str, msg_text.?, sk, meta);
+                const sk = telegramSessionKeyRouted(ctx.req_allocator, &kb, b, tg_cfg_opt, tg_account_id);
+                _ = publishToBus(eb, ctx.state.allocator, "telegram", sender, chat_target, msg_text.?, sk, meta);
                 ctx.response_body = "{\"status\":\"ok\"}";
             } else if (ctx.session_mgr_opt) |sm| {
                 var kb: [64]u8 = undefined;
                 const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
-                const sk = telegramSessionKeyRouted(ctx.req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
+                const sk = telegramSessionKeyRouted(ctx.req_allocator, &kb, b, tg_cfg_opt, tg_account_id);
                 const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?, null) catch |err| blk: {
                     if (tg_bot_token.len > 0) {
-                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, userFacingAgentError(err)) catch {};
+                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, thread_id, userFacingAgentError(err)) catch {};
                     }
                     break :blk null;
                 };
                 if (reply) |r| {
                     defer ctx.root_allocator.free(r);
                     if (tg_bot_token.len > 0) {
-                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, r) catch {};
+                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, thread_id, r) catch {};
                     }
                     ctx.response_body = "{\"status\":\"ok\"}";
                 } else {
@@ -2518,13 +2732,166 @@ fn handleQqWebhookRoute(ctx: *WebhookHandlerContext) void {
     ctx.response_body = "{\"status\":\"ok\"}";
 }
 
+fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_max) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"max channel disabled in this build\"}";
+        return;
+    }
+
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "max")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_body = "{\"status\":\"received\"}";
+        return;
+    };
+
+    const secret_header = extractHeader(ctx.raw_request, "X-Max-Bot-Api-Secret");
+    const max_cfg = selectMaxConfig(ctx.config_opt, ctx.target, secret_header) orelse {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"max not configured\"}";
+        return;
+    };
+
+    if (max_cfg.mode != .webhook) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"max webhook mode not enabled\"}";
+        return;
+    }
+
+    // Verify secret header if secret is configured
+    if (max_cfg.webhook_secret) |secret| {
+        if (secret.len > 0) {
+            if (secret_header) |sig| {
+                if (!std.mem.eql(u8, std.mem.trim(u8, sig, " \t\r\n"), secret)) {
+                    ctx.response_status = "403 Forbidden";
+                    ctx.response_body = "{\"error\":\"invalid secret\"}";
+                    return;
+                }
+            } else {
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"missing secret\"}";
+                return;
+            }
+        }
+    }
+
+    // Parse the update JSON
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid json payload\"}";
+        return;
+    };
+    defer parsed.deinit();
+
+    var max_ch = channels.max.MaxChannel.initFromConfig(ctx.req_allocator, max_cfg.*);
+
+    if (max_ch.processUpdate(ctx.req_allocator, parsed.value)) |inbound| {
+        defer inbound.deinit(ctx.req_allocator);
+
+        const reply_target = inbound.reply_target orelse inbound.sender;
+        const peer_id = if (inbound.is_group) reply_target else inbound.sender;
+        var kb: [192]u8 = undefined;
+        const sk = maxSessionKeyRouted(
+            ctx.req_allocator,
+            &kb,
+            inbound.sender,
+            reply_target,
+            inbound.is_group,
+            ctx.config_opt,
+            max_cfg.account_id,
+        );
+        const peer_kind: []const u8 = if (inbound.is_group) "group" else "direct";
+
+        if (ctx.state.event_bus) |eb| {
+            var meta_buf: [384]u8 = undefined;
+            const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
+                max_cfg.account_id,
+                peer_kind,
+                peer_id,
+            }) catch null;
+            _ = publishToBus(eb, ctx.state.allocator, "max", inbound.sender, reply_target, inbound.content, sk, meta);
+            ctx.response_body = "{\"status\":\"received\"}";
+            return;
+        }
+
+        if (ctx.session_mgr_opt) |sm| {
+            channels.max.setInteractiveOwnerContext(inbound.sender);
+            defer channels.max.setInteractiveOwnerContext(null);
+            const reply: ?[]const u8 = sm.processMessage(sk, inbound.content, null) catch |err| blk: {
+                max_ch.sendMessage(reply_target, userFacingAgentError(err)) catch {};
+                break :blk null;
+            };
+            if (reply) |r| {
+                defer ctx.root_allocator.free(r);
+                max_ch.sendMessage(reply_target, r) catch {};
+            }
+        }
+    }
+
+    ctx.response_body = "{\"status\":\"ok\"}";
+}
+
 fn applyRuntimeProviderOverrides(config: *const Config) !void {
     try http_util.setProxyOverride(config.http_request.proxy);
     try providers.setApiErrorLimitOverride(config.diagnostics.api_error_max_chars);
 }
 
+const A2aStreamingWorker = struct {
+    allocator: std.mem.Allocator,
+    body: []u8,
+    stream: std.net.Stream,
+    registry: *a2a.TaskRegistry,
+    session_mgr: *session_mod.SessionManager,
+
+    fn run(self: *@This()) void {
+        defer self.stream.close();
+        defer self.allocator.free(self.body);
+        defer self.allocator.destroy(self);
+        a2a.handleStreamingRpc(self.allocator, self.body, &self.stream, self.registry, self.session_mgr);
+    }
+};
+
+fn spawnA2aStreamingWorker(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    stream: std.net.Stream,
+    registry: *a2a.TaskRegistry,
+    session_mgr: *session_mod.SessionManager,
+) !void {
+    const worker = try allocator.create(A2aStreamingWorker);
+    errdefer allocator.destroy(worker);
+
+    const owned_body = try allocator.dupe(u8, body);
+    errdefer allocator.free(owned_body);
+
+    worker.* = .{
+        .allocator = allocator,
+        .body = owned_body,
+        .stream = stream,
+        .registry = registry,
+        .session_mgr = session_mgr,
+    };
+
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
+        A2aStreamingWorker.run,
+        .{worker},
+    );
+    thread.detach();
+}
+
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, POST /qq
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, POST /qq, POST /max
 /// If config_ptr is null, loads config internally (for backward compatibility).
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr: ?*const Config, event_bus: ?*bus_mod.Bus) !void {
     health.markComponentOk("gateway");
@@ -2556,6 +2923,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var sec_policy_opt: ?security.SecurityPolicy = null;
     var gateway_thread_observer = GatewayThreadObserver.init(allocator);
     defer gateway_thread_observer.deinit();
+    var a2a_registry = a2a.TaskRegistry.init(allocator);
+    defer a2a_registry.deinit();
     const needs_local_agent = event_bus == null;
 
     if (config_opt) |cfg_ptr| {
@@ -2606,8 +2975,9 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         }
 
         // In daemon mode (`event_bus` is present), inbound processing is delegated to
-        // the bus + channel runtime. Avoid creating a second local agent runtime here.
-        if (needs_local_agent) {
+        // the bus + channel runtime. However, A2A requires a synchronous session manager
+        // for request-response JSON-RPC, so also init when A2A is enabled.
+        if (needs_local_agent or cfg.a2a.enabled) {
             sec_tracker_opt = security.RateTracker.init(allocator, cfg.autonomy.max_actions_per_hour);
             sec_policy_opt = .{
                 .autonomy = cfg.autonomy.level,
@@ -2698,8 +3068,12 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
     // Resolve the listen address
     const addr = try std.net.Address.resolveIp(host, port);
+    const daemon_mode = event_bus != null;
     var server = try addr.listen(.{
         .reuse_address = true,
+        // Daemon/service shutdown needs the accept loop to observe the shared
+        // shutdown flag instead of blocking forever in accept().
+        .force_nonblocking = daemon_mode,
     });
     defer server.deinit();
 
@@ -2725,8 +3099,17 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
     // Accept loop — read raw HTTP from TCP connections
     while (true) {
-        var conn = server.accept() catch continue;
-        defer conn.stream.close();
+        if (daemon_mode and daemon.isShutdownRequested()) break;
+
+        var conn = server.accept() catch |err| switch (err) {
+            error.WouldBlock => {
+                std.Thread.sleep(ACCEPT_POLL_INTERVAL_MS * std.time.ns_per_ms);
+                continue;
+            },
+            else => continue,
+        };
+        var close_conn = true;
+        defer if (close_conn) conn.stream.close();
         configureRequestReadTimeout(&conn.stream);
 
         // Per-request arena — all request-scoped allocations freed in one shot
@@ -2794,6 +3177,71 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             handleSlackWebhookRoute(&webhook_ctx);
             response_status = webhook_ctx.response_status;
             response_body = webhook_ctx.response_body;
+        } else if (std.mem.eql(u8, base_path, "/.well-known/agent.json") or
+            std.mem.eql(u8, base_path, "/.well-known/agent-card.json"))
+        {
+            // A2A Agent Card discovery (public, no auth).
+            if (config_opt) |cfg| {
+                if (cfg.a2a.enabled) {
+                    const card = a2a.handleAgentCard(req_allocator, cfg);
+                    response_status = card.status;
+                    response_body = card.body;
+                } else {
+                    response_status = "404 Not Found";
+                    response_body = "{\"error\":\"a2a not enabled\"}";
+                }
+            } else {
+                response_status = "404 Not Found";
+                response_body = "{\"error\":\"not configured\"}";
+            }
+        } else if (std.mem.eql(u8, base_path, "/a2a")) {
+            // A2A JSON-RPC endpoint (auth required).
+            if (!is_post) {
+                response_status = "405 Method Not Allowed";
+                response_body = "{\"error\":\"method not allowed\"}";
+            } else if (config_opt == null or !config_opt.?.a2a.enabled) {
+                response_status = "404 Not Found";
+                response_body = "{\"error\":\"a2a not enabled\"}";
+            } else {
+                const auth_header = extractHeader(raw, "Authorization");
+                const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
+                const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
+                if (!isWebhookAuthorized(pairing_guard, bearer)) {
+                    response_status = "401 Unauthorized";
+                    response_body = "{\"error\":\"unauthorized\"}";
+                } else if (!state.rate_limiter.allowWebhook(state.allocator, "a2a")) {
+                    response_status = "429 Too Many Requests";
+                    response_body = "{\"error\":\"rate limited\"}";
+                } else {
+                    const body = extractBody(raw);
+                    if (body) |b| {
+                        if (session_mgr_opt) |*sm| {
+                            if (a2a.isStreamingMethod(b)) {
+                                // SSE streaming runs in its own worker so the main accept
+                                // loop can continue serving tasks/cancel and new requests.
+                                if (spawnA2aStreamingWorker(allocator, b, conn.stream, &a2a_registry, sm)) {
+                                    close_conn = false;
+                                    response_status = "";
+                                    response_body = "";
+                                } else |_| {
+                                    response_status = "503 Service Unavailable";
+                                    response_body = "{\"error\":\"stream setup failed\"}";
+                                }
+                            } else {
+                                const resp = a2a.handleJsonRpc(req_allocator, b, &a2a_registry, sm);
+                                response_status = resp.status;
+                                response_body = resp.body;
+                            }
+                        } else {
+                            response_status = "503 Service Unavailable";
+                            response_body = "{\"error\":\"agent not available\"}";
+                        }
+                    } else {
+                        response_status = "400 Bad Request";
+                        response_body = "{\"error\":\"empty body\"}";
+                    }
+                }
+            }
         } else if (control_route_map.get(base_path)) |route| switch (route) {
             .health => {
                 response_body = if (isHealthOk()) "{\"status\":\"ok\"}" else "{\"status\":\"degraded\"}";
@@ -2918,8 +3366,10 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             response_body = "{\"error\":\"not found\"}";
         }
 
-        // Send HTTP response
-        writeJsonResponse(&conn.stream, response_status, response_body);
+        // Send HTTP response (skip if SSE streaming already wrote directly).
+        if (response_status.len > 0) {
+            writeJsonResponse(&conn.stream, response_status, response_body);
+        }
     }
 }
 
@@ -2997,6 +3447,7 @@ test "findWebhookRouteDescriptor resolves known webhook paths" {
     try std.testing.expect(findWebhookRouteDescriptor("/line") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/lark") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/qq") != null);
+    try std.testing.expect(findWebhookRouteDescriptor("/max") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/health") == null);
 }
 
@@ -3405,6 +3856,161 @@ test "selectTelegramConfig falls back to preferred primary account" {
     try std.testing.expectEqualStrings("default", selected.?.account_id);
 }
 
+test "selectMaxConfig picks account by secret header" {
+    const max_accounts = [_]config_types.MaxConfig{
+        .{
+            .account_id = "main",
+            .bot_token = "max-main",
+            .mode = .webhook,
+            .webhook_secret = "secret-a",
+        },
+        .{
+            .account_id = "backup",
+            .bot_token = "max-backup",
+            .mode = .webhook,
+            .webhook_secret = "secret-b",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .max = &max_accounts,
+        },
+    };
+
+    const selected = selectMaxConfig(&cfg, "/max", "secret-b");
+    if (!build_options.enable_channel_max) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectMaxConfig picks account by query account_id" {
+    const max_accounts = [_]config_types.MaxConfig{
+        .{
+            .account_id = "main",
+            .bot_token = "max-main",
+        },
+        .{
+            .account_id = "backup",
+            .bot_token = "max-backup",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .max = &max_accounts,
+        },
+    };
+
+    const selected = selectMaxConfig(&cfg, "/max?account_id=backup", null);
+    if (!build_options.enable_channel_max) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectMaxConfig does not fall back when secret header is invalid" {
+    const max_accounts = [_]config_types.MaxConfig{
+        .{
+            .account_id = "main",
+            .bot_token = "max-main",
+            .mode = .webhook,
+            .webhook_secret = "secret-a",
+        },
+        .{
+            .account_id = "backup",
+            .bot_token = "max-backup",
+            .mode = .webhook,
+            .webhook_secret = "secret-b",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .max = &max_accounts,
+        },
+    };
+
+    const selected = selectMaxConfig(&cfg, "/max", "wrong-secret");
+    if (!build_options.enable_channel_max) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected == null);
+}
+
+test "selectMaxConfig requires explicit routing when multiple webhook accounts exist" {
+    const max_accounts = [_]config_types.MaxConfig{
+        .{
+            .account_id = "main",
+            .bot_token = "max-main",
+            .mode = .webhook,
+        },
+        .{
+            .account_id = "backup",
+            .bot_token = "max-backup",
+            .mode = .webhook,
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .max = &max_accounts,
+        },
+    };
+
+    const selected = selectMaxConfig(&cfg, "/max", null);
+    if (!build_options.enable_channel_max) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected == null);
+}
+
+test "selectMaxConfig picks sole webhook account even when polling account exists" {
+    const max_accounts = [_]config_types.MaxConfig{
+        .{
+            .account_id = "poller",
+            .bot_token = "max-poll",
+            .mode = .polling,
+        },
+        .{
+            .account_id = "webhook",
+            .bot_token = "max-webhook",
+            .mode = .webhook,
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .max = &max_accounts,
+        },
+    };
+
+    const selected = selectMaxConfig(&cfg, "/max", null);
+    if (!build_options.enable_channel_max) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("webhook", selected.?.account_id);
+}
+
 test "selectWhatsAppConfig picks account by verify_token" {
     const wa_accounts = [_]config_types.WhatsAppConfig{
         .{
@@ -3653,6 +4259,26 @@ test "telegramChatId falls back to flat chat_id for backward compatibility" {
     try std.testing.expectEqual(@as(i64, 12345), telegramChatId(allocator, body).?);
 }
 
+test "telegramWebhookTarget extracts topic thread id from message" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"message":{"chat":{"id":-100777,"type":"supergroup"},"message_thread_id":42,"text":"hi"}}
+    ;
+    const target = telegramWebhookTarget(allocator, body) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(i64, -100777), target.chat_id);
+    try std.testing.expect(target.is_group);
+    try std.testing.expectEqual(@as(?i64, 42), target.message_thread_id);
+}
+
+test "telegramWebhookTarget falls back to reply message id for topic replies" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"message":{"chat":{"id":-100777,"type":"supergroup"},"is_topic_message":true,"reply_to_message":{"message_id":88},"text":"hi"}}
+    ;
+    const target = telegramWebhookTarget(allocator, body) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(?i64, 88), target.message_thread_id);
+}
+
 test "telegramSenderAllowed matches numeric sender id from nested from object" {
     const allocator = std.testing.allocator;
     const allow_from = [_][]const u8{"12345"};
@@ -3823,7 +4449,7 @@ test "telegramSessionKeyRouted uses group peer for group chats" {
         },
     };
 
-    const key = telegramSessionKeyRouted(allocator, &key_buf, -10012345, body, &cfg, "tg-main");
+    const key = telegramSessionKeyRouted(allocator, &key_buf, body, &cfg, "tg-main");
     try std.testing.expectEqualStrings("agent:tg-group-agent:telegram:group:-10012345", key);
 }
 
@@ -3853,7 +4479,7 @@ test "telegramSessionKeyRouted uses direct peer for private chats" {
         },
     };
 
-    const key = telegramSessionKeyRouted(allocator, &key_buf, 4242, body, &cfg, "tg-main");
+    const key = telegramSessionKeyRouted(allocator, &key_buf, body, &cfg, "tg-main");
     try std.testing.expectEqualStrings("agent:tg-dm-agent:telegram:direct:4242", key);
 }
 
@@ -3886,8 +4512,46 @@ test "telegramSessionKeyRouted applies session dm_scope for direct chats" {
         },
     };
 
-    const key = telegramSessionKeyRouted(allocator, &key_buf, 4242, body, &cfg, "tg-main");
+    const key = telegramSessionKeyRouted(allocator, &key_buf, body, &cfg, "tg-main");
     try std.testing.expectEqualStrings("agent:tg-dm-agent:direct:4242", key);
+}
+
+test "telegramSessionKeyRouted uses topic peer before group fallback" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const body =
+        \\{"message":{"chat":{"id":-10012345,"type":"supergroup"},"message_thread_id":42,"text":"hi"}}
+    ;
+    var key_buf: [128]u8 = undefined;
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "tg-topic-agent",
+                .match = .{
+                    .channel = "telegram",
+                    .account_id = "tg-main",
+                    .peer = .{ .kind = .group, .id = "-10012345:thread:42" },
+                },
+            },
+            .{
+                .agent_id = "tg-group-agent",
+                .match = .{
+                    .channel = "telegram",
+                    .account_id = "tg-main",
+                    .peer = .{ .kind = .group, .id = "-10012345" },
+                },
+            },
+        },
+    };
+
+    const key = telegramSessionKeyRouted(allocator, &key_buf, body, &cfg, "tg-main");
+    try std.testing.expectEqualStrings("agent:tg-topic-agent:telegram:group:-10012345:thread:42", key);
 }
 
 test "lineSessionKeyRouted uses group id for group events" {
@@ -4028,6 +4692,58 @@ test "larkSessionKeyRouted uses route engine when config exists" {
 
     const key = larkSessionKeyRouted(allocator, &key_buf, msg, &cfg, "lark-main");
     try std.testing.expectEqualStrings("agent:lark-group-agent:lark:group:ou_abc123", key);
+}
+
+test "maxSessionKeyRouted uses sender identity for direct chats" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key_buf: [128]u8 = undefined;
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "max-direct-agent",
+                .match = .{
+                    .channel = "max",
+                    .account_id = "max-main",
+                    .peer = .{ .kind = .direct, .id = "alice" },
+                },
+            },
+        },
+    };
+
+    const key = maxSessionKeyRouted(allocator, &key_buf, "alice", "dialog-123", false, &cfg, "max-main");
+    try std.testing.expectEqualStrings("agent:max-direct-agent:max:direct:alice", key);
+}
+
+test "maxSessionKeyRouted uses chat target for group chats" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key_buf: [128]u8 = undefined;
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "max-group-agent",
+                .match = .{
+                    .channel = "max",
+                    .account_id = "max-main",
+                    .peer = .{ .kind = .group, .id = "chat-777" },
+                },
+            },
+        },
+    };
+
+    const key = maxSessionKeyRouted(allocator, &key_buf, "alice", "chat-777", true, &cfg, "max-main");
+    try std.testing.expectEqualStrings("agent:max-group-agent:max:group:chat-777", key);
 }
 
 // ── extractBody tests ────────────────────────────────────────────

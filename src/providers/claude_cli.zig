@@ -195,22 +195,31 @@ pub const ClaudeCliProvider = struct {
         defer allocator.free(current_hashes);
 
         const now_ns = std.time.nanoTimestamp();
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        const plan = blk: {
-            const state = try self.getOrCreateSessionStateLocked(session_key);
-            const planned = buildSessionPlan(state, messages, current_hashes, now_ns);
-            if (planned.reset_state) self.deleteSessionStateLocked(session_key);
-            break :blk planned;
+        var plan = ClaudeCliProvider.SessionPlan{
+            .use_resume = false,
+            .delta_start = 0,
+            .reset_state = false,
         };
+        var resume_session_id: ?[]u8 = null;
+        defer if (resume_session_id) |sid| allocator.free(sid);
 
-        if (plan.use_resume) {
-            const state = self.sessions.getPtr(session_key) orelse return error.SessionStateMissing;
+        self.mutex.lock();
+        {
+            defer self.mutex.unlock();
+            const state = try self.getOrCreateSessionStateLocked(session_key);
+            plan = buildSessionPlan(state, messages, current_hashes, now_ns);
+            if (plan.reset_state) {
+                self.deleteSessionStateLocked(session_key);
+            } else if (plan.use_resume) {
+                resume_session_id = try allocator.dupe(u8, state.cli_session_id.?);
+            }
+        }
+
+        if (resume_session_id) |sid| {
             const resume_prompt = renderPromptMessages(allocator, messages, plan.delta_start) catch |err| switch (err) {
                 error.NoUserMessage => {
-                    self.deleteSessionStateLocked(session_key);
-                    return try self.runFreshSessionChatLocked(allocator, session_key, messages, current_hashes, system_prompt, model, now_ns);
+                    self.deleteSessionState(session_key);
+                    return try self.runFreshSessionChat(allocator, session_key, messages, current_hashes, system_prompt, model, now_ns);
                 },
                 else => return err,
             };
@@ -219,25 +228,25 @@ pub const ClaudeCliProvider = struct {
             const resume_result = runClaudeCommand(allocator, .{
                 .prompt = resume_prompt,
                 .model = model,
-                .resume_session_id = state.cli_session_id.?,
+                .resume_session_id = sid,
             }) catch |err| switch (err) {
                 error.CliProcessFailed, error.NoResultInOutput => {
-                    self.deleteSessionStateLocked(session_key);
-                    return try self.runFreshSessionChatLocked(allocator, session_key, messages, current_hashes, system_prompt, model, now_ns);
+                    self.deleteSessionState(session_key);
+                    return try self.runFreshSessionChat(allocator, session_key, messages, current_hashes, system_prompt, model, now_ns);
                 },
                 else => return err,
             };
             errdefer allocator.free(resume_result.result);
             defer if (resume_result.session_id) |new_sid| allocator.free(new_sid);
 
-            try self.recordSuccessfulTurnLocked(session_key, current_hashes, resume_result.result, resume_result.session_id, now_ns);
+            try self.recordSuccessfulTurn(session_key, current_hashes, resume_result.result, resume_result.session_id, now_ns);
             return resume_result.result;
         }
 
-        return try self.runFreshSessionChatLocked(allocator, session_key, messages, current_hashes, system_prompt, model, now_ns);
+        return try self.runFreshSessionChat(allocator, session_key, messages, current_hashes, system_prompt, model, now_ns);
     }
 
-    fn runFreshSessionChatLocked(
+    fn runFreshSessionChat(
         self: *ClaudeCliProvider,
         allocator: std.mem.Allocator,
         session_key: []const u8,
@@ -258,11 +267,11 @@ pub const ClaudeCliProvider = struct {
         errdefer allocator.free(result.result);
         defer if (result.session_id) |sid| allocator.free(sid);
 
-        try self.recordSuccessfulTurnLocked(session_key, current_hashes, result.result, result.session_id, now_ns);
+        try self.recordSuccessfulTurn(session_key, current_hashes, result.result, result.session_id, now_ns);
         return result.result;
     }
 
-    fn recordSuccessfulTurnLocked(
+    fn recordSuccessfulTurn(
         self: *ClaudeCliProvider,
         session_key: []const u8,
         current_hashes: []const u64,
@@ -270,8 +279,18 @@ pub const ClaudeCliProvider = struct {
         session_id: ?[]const u8,
         now_ns: i128,
     ) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         const state = try self.getOrCreateSessionStateLocked(session_key);
         try state.updateTranscript(self.allocator, current_hashes, response_content, session_id, now_ns);
+    }
+
+    fn deleteSessionState(self: *ClaudeCliProvider, session_key: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.deleteSessionStateLocked(session_key);
     }
 
     fn deleteSessionStateLocked(self: *ClaudeCliProvider, session_key: []const u8) void {
