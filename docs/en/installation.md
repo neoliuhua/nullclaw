@@ -215,13 +215,22 @@ If `status` returns component state successfully, runtime basics are ready.
 
 ## Upgrade and Uninstall
 
-### Homebrew
+### Homebrew（Recommended for macOS/Linux）
 
+- update:
 ```bash
 brew update
 brew upgrade nullclaw
+```
+- uninstall:
+```bash
 brew uninstall nullclaw
 ```
+#### Command line(CMD) (Windows)
+
+- update: `nullclaw update`
+
+- uninstall: delete the `nullclaw` binary file and remove the entry of the directory containing the binary file in environment variables PATH if it exists.
 
 ### Source install
 
