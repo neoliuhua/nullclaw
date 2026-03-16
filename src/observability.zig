@@ -1,6 +1,5 @@
 const std = @import("std");
 const Atomic = @import("portable_atomic.zig").Atomic;
-const config_types = @import("config_types.zig");
 
 /// Events the observer can record.
 pub const ObserverEvent = union(enum) {
@@ -247,6 +246,8 @@ pub const MultiObserver = struct {
 
 // ── FileObserver ─────────────────────────────────────────────────────
 
+var file_observer_mutex: std.Thread.Mutex = .{};
+
 /// Appends events as JSONL to a log file.
 pub const FileObserver = struct {
     path: []const u8,
@@ -270,6 +271,9 @@ pub const FileObserver = struct {
     }
 
     fn appendToFile(self: *FileObserver, line: []const u8) void {
+        file_observer_mutex.lock();
+        defer file_observer_mutex.unlock();
+
         const file = std.fs.cwd().openFile(self.path, .{ .mode = .write_only }) catch {
             // Try creating the file if it doesn't exist
             const new_file = std.fs.cwd().createFile(self.path, .{ .truncate = false }) catch return;
@@ -375,14 +379,24 @@ const http_util = @import("http_util.zig");
 
 /// OpenTelemetry OTLP/HTTP observer — batches spans and exports via JSON.
 pub const OtelObserver = struct {
+    pub const HeaderEntry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    const TraceContext = struct {
+        trace_id: [32]u8 = .{0} ** 32,
+        start_ns: u64 = 0,
+        active: bool = false,
+    };
+
     allocator: std.mem.Allocator,
     endpoint: []const u8,
     service_name: []const u8,
     headers: []const []const u8,
     spans: std.ArrayListUnmanaged(OtelSpan),
+    trace_contexts: std.AutoHashMapUnmanaged(std.Thread.Id, TraceContext),
     mutex: std.Thread.Mutex,
-    current_trace_id: [32]u8,
-    current_start_ns: u64,
     requests_total: Atomic(u64),
     errors_total: Atomic(u64),
 
@@ -402,9 +416,8 @@ pub const OtelObserver = struct {
             .service_name = service_name orelse "nullclaw",
             .headers = &.{},
             .spans = .empty,
+            .trace_contexts = .{},
             .mutex = .{},
-            .current_trace_id = .{0} ** 32,
-            .current_start_ns = 0,
             .requests_total = Atomic(u64).init(0),
             .errors_total = Atomic(u64).init(0),
         };
@@ -414,7 +427,7 @@ pub const OtelObserver = struct {
         allocator: std.mem.Allocator,
         endpoint: ?[]const u8,
         service_name: ?[]const u8,
-        headers: []const config_types.DiagnosticsConfig.OtelHeaderEntry,
+        headers: anytype,
     ) !OtelObserver {
         var self = init(allocator, endpoint, service_name);
         if (headers.len == 0) return self;
@@ -450,6 +463,7 @@ pub const OtelObserver = struct {
             span.deinit(self.allocator);
         }
         self.spans.deinit(self.allocator);
+        self.trace_contexts.deinit(self.allocator);
         for (self.headers) |header| {
             self.allocator.free(header);
         }
@@ -479,9 +493,36 @@ pub const OtelObserver = struct {
         return @intCast(std.time.nanoTimestamp());
     }
 
+    fn contextForCurrentThread(self: *OtelObserver, now: u64) ?*TraceContext {
+        const thread_id = std.Thread.getCurrentId();
+        const gop = self.trace_contexts.getOrPut(self.allocator, thread_id) catch return null;
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+        }
+        if (!gop.value_ptr.active) {
+            randomHex(&gop.value_ptr.trace_id);
+            gop.value_ptr.start_ns = now;
+            gop.value_ptr.active = true;
+        }
+        return gop.value_ptr;
+    }
+
+    fn startCurrentTrace(self: *OtelObserver, now: u64) void {
+        const ctx = self.contextForCurrentThread(now) orelse return;
+        randomHex(&ctx.trace_id);
+        ctx.start_ns = now;
+        ctx.active = true;
+    }
+
+    fn clearCurrentTrace(self: *OtelObserver) void {
+        _ = self.trace_contexts.fetchRemove(std.Thread.getCurrentId());
+    }
+
     fn addSpan(self: *OtelObserver, name: []const u8, start_ns: u64, end_ns: u64, attrs: []const OtelAttribute) void {
         var span_id: [16]u8 = undefined;
         randomHex(&span_id);
+        const trace_ctx = self.contextForCurrentThread(if (start_ns > 0) start_ns else end_ns);
+        const trace_id = if (trace_ctx) |ctx| ctx.trace_id else [_]u8{0} ** 32;
 
         var attributes: std.ArrayListUnmanaged(OtelAttribute) = .empty;
         for (attrs) |attr| {
@@ -501,7 +542,7 @@ pub const OtelObserver = struct {
         }
 
         self.spans.append(self.allocator, .{
-            .trace_id = self.current_trace_id,
+            .trace_id = trace_id,
             .span_id = span_id,
             .name = name,
             .start_ns = start_ns,
@@ -530,20 +571,20 @@ pub const OtelObserver = struct {
 
         switch (event.*) {
             .agent_start => |e| {
-                randomHex(&self.current_trace_id);
-                self.current_start_ns = now;
+                self.startCurrentTrace(now);
                 self.addSpan("agent.start", now, now, &.{
                     .{ .key = "provider", .value = e.provider },
                     .{ .key = "model", .value = e.model },
                 });
             },
             .agent_end => |e| {
-                const start = if (self.current_start_ns > 0) self.current_start_ns else now;
+                const start = if (self.contextForCurrentThread(now)) |ctx| ctx.start_ns else now;
                 var dur_buf: [20]u8 = undefined;
                 const dur_str = std.fmt.bufPrint(&dur_buf, "{d}", .{e.duration_ms}) catch "0";
                 self.addSpan("agent.end", start, now, &.{
                     .{ .key = "duration_ms", .value = dur_str },
                 });
+                self.clearCurrentTrace();
             },
             .llm_request => |e| {
                 _ = self.requests_total.fetchAdd(1, .monotonic);
@@ -597,6 +638,7 @@ pub const OtelObserver = struct {
             },
             .turn_complete => {
                 self.addSpan("turn.complete", now, now, &.{});
+                self.clearCurrentTrace();
             },
             .channel_message => |e| {
                 self.addSpan("channel.message", now, now, &.{
@@ -733,8 +775,17 @@ pub const OtelObserver = struct {
 /// Heap-owned runtime observer that wires config-selected backends into long-lived
 /// agent/session runtimes without dangling vtable pointers.
 pub const RuntimeObserver = struct {
+    pub const Config = struct {
+        workspace_dir: []const u8,
+        backend: []const u8 = "none",
+        file_path: ?[]const u8 = null,
+        otel_endpoint: ?[]const u8 = null,
+        otel_service_name: ?[]const u8 = null,
+    };
+
     allocator: std.mem.Allocator,
     active_backend: Backend = .noop,
+    primary_backend: Backend = .noop,
     noop: NoopObserver = .{},
     log: LogObserver = .{},
     verbose: VerboseObserver = .{},
@@ -755,15 +806,15 @@ pub const RuntimeObserver = struct {
 
     pub fn create(
         allocator: std.mem.Allocator,
-        workspace_dir: []const u8,
-        diagnostics: config_types.DiagnosticsConfig,
+        config: Config,
+        otel_headers: anytype,
         extra_observers: []const Observer,
     ) !*RuntimeObserver {
         const self = try allocator.create(RuntimeObserver);
         errdefer allocator.destroy(self);
         self.* = .{ .allocator = allocator };
         errdefer self.deinit();
-        try self.initInPlace(workspace_dir, diagnostics, extra_observers);
+        try self.initInPlace(config, otel_headers, extra_observers);
         return self;
     }
 
@@ -780,6 +831,17 @@ pub const RuntimeObserver = struct {
             .file => self.file.?.observer(),
             .otel => self.otel.?.observer(),
             .multi => self.multi.?.observer(),
+        };
+    }
+
+    pub fn backendObserver(self: *RuntimeObserver) Observer {
+        return switch (self.primary_backend) {
+            .noop => self.noop.observer(),
+            .log => self.log.observer(),
+            .verbose => self.verbose.observer(),
+            .file => self.file.?.observer(),
+            .otel => self.otel.?.observer(),
+            .multi => unreachable,
         };
     }
 
@@ -800,38 +862,43 @@ pub const RuntimeObserver = struct {
         }
         self.file = null;
         self.active_backend = .noop;
+        self.primary_backend = .noop;
     }
 
     fn initInPlace(
         self: *RuntimeObserver,
-        workspace_dir: []const u8,
-        diagnostics: config_types.DiagnosticsConfig,
+        config: Config,
+        otel_headers: anytype,
         extra_observers: []const Observer,
     ) !void {
-        const backend = createObserver(diagnostics.backend);
+        const backend = createObserver(config.backend);
         const include_base = !std.mem.eql(u8, backend, "multi");
 
         if (std.mem.eql(u8, backend, "log")) {
-            self.active_backend = .log;
+            self.primary_backend = .log;
         } else if (std.mem.eql(u8, backend, "verbose")) {
-            self.active_backend = .verbose;
+            self.primary_backend = .verbose;
         } else if (std.mem.eql(u8, backend, "file")) {
-            self.owned_file_path = try std.fmt.allocPrint(self.allocator, "{s}/nullclaw-observability.jsonl", .{workspace_dir});
+            self.owned_file_path = if (config.file_path) |path|
+                try self.allocator.dupe(u8, path)
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}/nullclaw-observability.jsonl", .{config.workspace_dir});
             self.file = .{ .path = self.owned_file_path.? };
-            self.active_backend = .file;
+            self.primary_backend = .file;
         } else if (std.mem.eql(u8, backend, "otel")) {
             self.otel = try OtelObserver.initWithHeaders(
                 self.allocator,
-                diagnostics.otel_endpoint,
-                diagnostics.otel_service_name,
-                diagnostics.otel_headers,
+                config.otel_endpoint,
+                config.otel_service_name,
+                otel_headers,
             );
-            self.active_backend = .otel;
+            self.primary_backend = .otel;
         } else {
-            self.active_backend = .noop;
+            self.primary_backend = .noop;
         }
+        self.active_backend = self.primary_backend;
 
-        const should_include_base = include_base and self.active_backend != .noop;
+        const should_include_base = include_base and self.primary_backend != .noop;
         const total = extra_observers.len + @as(usize, if (should_include_base) 1 else 0);
         if (total == 0) return;
 
@@ -850,7 +917,7 @@ pub const RuntimeObserver = struct {
     }
 
     fn baseObserver(self: *RuntimeObserver) Observer {
-        return switch (self.active_backend) {
+        return switch (self.primary_backend) {
             .noop => self.noop.observer(),
             .log => self.log.observer(),
             .verbose => self.verbose.observer(),
@@ -1029,6 +1096,50 @@ test "FileObserver tool_call detail is persisted as JSON string" {
 
     try std.testing.expect(std.mem.indexOf(u8, content, "\"event\":\"tool_call\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"detail\":\"exit code 1: \\\"permission denied\\\"\"") != null);
+}
+
+test "FileObserver serializes concurrent appends" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const path = try std.fmt.allocPrint(allocator, "{s}/obs_parallel.jsonl", .{base});
+    defer allocator.free(path);
+
+    var file_obs = FileObserver{ .path = path };
+    const obs = file_obs.observer();
+
+    const Worker = struct {
+        fn run(observer: Observer, tool: []const u8) void {
+            var i: usize = 0;
+            while (i < 32) : (i += 1) {
+                const event = ObserverEvent{ .tool_call = .{
+                    .tool = tool,
+                    .duration_ms = @intCast(i),
+                    .success = true,
+                } };
+                observer.recordEvent(&event);
+            }
+        }
+    };
+
+    const thread_a = try std.Thread.spawn(.{}, Worker.run, .{ obs, "shell" });
+    const thread_b = try std.Thread.spawn(.{}, Worker.run, .{ obs, "web_fetch" });
+    thread_a.join();
+    thread_b.join();
+
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 16 * 1024);
+    defer allocator.free(content);
+
+    var line_count: usize = 0;
+    for (content) |byte| {
+        if (byte == '\n') line_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 64), line_count);
 }
 
 // ── Additional observability tests ──────────────────────────────
@@ -1253,7 +1364,7 @@ test "OtelObserver init custom endpoint" {
 }
 
 test "OtelObserver initWithHeaders builds curl headers" {
-    const headers = [_]config_types.DiagnosticsConfig.OtelHeaderEntry{
+    const headers = [_]OtelObserver.HeaderEntry{
         .{ .key = "Authorization", .value = "Bearer secret" },
         .{ .key = "x-nullwatch-source", .value = "nullclaw" },
     };
@@ -1267,22 +1378,23 @@ test "OtelObserver initWithHeaders builds curl headers" {
 
 test "RuntimeObserver combines configured backend with extra observers" {
     var extra = NoopObserver{};
-    const headers = [_]config_types.DiagnosticsConfig.OtelHeaderEntry{
+    const headers = [_]OtelObserver.HeaderEntry{
         .{ .key = "Authorization", .value = "Bearer secret" },
     };
     const runtime_observer = try RuntimeObserver.create(
         std.testing.allocator,
-        "/tmp",
         .{
+            .workspace_dir = "/tmp",
             .backend = "otel",
             .otel_service_name = "nullclaw",
-            .otel_headers = &headers,
         },
+        &headers,
         &.{extra.observer()},
     );
     defer runtime_observer.destroy();
 
     try std.testing.expectEqualStrings("multi", runtime_observer.observer().getName());
+    try std.testing.expectEqualStrings("otel", runtime_observer.backendObserver().getName());
     try std.testing.expect(runtime_observer.otel != null);
     try std.testing.expectEqual(@as(usize, 1), runtime_observer.otel.?.headers.len);
     try std.testing.expectEqualStrings("Authorization: Bearer secret", runtime_observer.otel.?.headers[0]);
@@ -1301,13 +1413,57 @@ test "OtelObserver span building on agent_start" {
     try std.testing.expectEqualStrings("agent.start", otel.spans.items[0].name);
     // trace_id should be set (not all zeros)
     var all_zero = true;
-    for (otel.current_trace_id) |b| {
+    for (otel.spans.items[0].trace_id) |b| {
         if (b != 0) {
             all_zero = false;
             break;
         }
     }
     try std.testing.expect(!all_zero);
+}
+
+test "OtelObserver resets trace after turn_complete" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const first = ObserverEvent{ .llm_request = .{ .provider = "a", .model = "m", .messages_count = 1 } };
+    const complete = ObserverEvent{ .turn_complete = {} };
+    const second = ObserverEvent{ .llm_request = .{ .provider = "b", .model = "m", .messages_count = 1 } };
+
+    obs.recordEvent(&first);
+    obs.recordEvent(&complete);
+    obs.recordEvent(&second);
+
+    try std.testing.expectEqual(@as(usize, 3), otel.spans.items.len);
+    try std.testing.expect(!std.mem.eql(u8, &otel.spans.items[0].trace_id, &otel.spans.items[2].trace_id));
+}
+
+test "OtelObserver isolates trace context per thread" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+
+    const Worker = struct {
+        fn run(observer: *OtelObserver, provider: []const u8) void {
+            const obs = observer.observer();
+            const request = ObserverEvent{ .llm_request = .{
+                .provider = provider,
+                .model = "m",
+                .messages_count = 1,
+            } };
+            const complete = ObserverEvent{ .turn_complete = {} };
+            obs.recordEvent(&request);
+            obs.recordEvent(&complete);
+        }
+    };
+
+    const thread_a = try std.Thread.spawn(.{}, Worker.run, .{ &otel, "alpha" });
+    const thread_b = try std.Thread.spawn(.{}, Worker.run, .{ &otel, "beta" });
+    thread_a.join();
+    thread_b.join();
+
+    try std.testing.expectEqual(@as(usize, 4), otel.spans.items.len);
+    try std.testing.expect(!std.mem.eql(u8, &otel.spans.items[0].trace_id, &otel.spans.items[2].trace_id));
 }
 
 test "OtelObserver span building on all event types" {

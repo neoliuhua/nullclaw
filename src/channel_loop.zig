@@ -1109,12 +1109,20 @@ pub const ChannelRuntime = struct {
 
         const runtime_observer = try observability.RuntimeObserver.create(
             allocator,
-            config.workspace_dir,
-            config.diagnostics,
+            .{
+                .workspace_dir = config.workspace_dir,
+                .backend = config.diagnostics.backend,
+                .otel_endpoint = config.diagnostics.otel_endpoint,
+                .otel_service_name = config.diagnostics.otel_service_name,
+            },
+            config.diagnostics.otel_headers,
             &.{},
         );
         errdefer runtime_observer.destroy();
         const obs = runtime_observer.observer();
+        if (subagent_manager) |mgr| {
+            mgr.observer = runtime_observer.backendObserver();
+        }
 
         // Session manager
         var session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);

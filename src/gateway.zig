@@ -3427,8 +3427,13 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         try applyRuntimeProviderOverrides(cfg);
         runtime_observer = try observability.RuntimeObserver.create(
             allocator,
-            cfg.workspace_dir,
-            cfg.diagnostics,
+            .{
+                .workspace_dir = cfg.workspace_dir,
+                .backend = cfg.diagnostics.backend,
+                .otel_endpoint = cfg.diagnostics.otel_endpoint,
+                .otel_service_name = cfg.diagnostics.otel_service_name,
+            },
+            cfg.diagnostics.otel_headers,
             &.{gateway_thread_observer.observer()},
         );
         state.rate_limiter = GatewayRateLimiter.init(
@@ -3512,6 +3517,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
                 if (subagent_manager) |mgr| {
                     mgr.* = subagent_mod.SubagentManager.init(allocator, cfg, event_bus, .{});
+                    mgr.observer = runtime_observer.?.backendObserver();
                     mgr.task_runner = subagent_runner.runTaskWithTools;
                     subagent_manager_opt = mgr;
                 }
