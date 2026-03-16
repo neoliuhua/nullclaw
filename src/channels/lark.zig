@@ -184,10 +184,10 @@ pub const LarkChannel = struct {
             if (event != .object) return result.items;
 
             const root_context = val.object.get("context");
-            const open_id = extractCardActionOpenId(event) orelse return result.items;
-            if (!self.isUserAllowed(open_id)) return result.items;
+            const open_id = extractCardActionOpenId(event);
+            if (!isCardActionAllowed(self, event)) return result.items;
 
-            const chat_id = extractCardActionChatId(event, root_context) orelse open_id;
+            const chat_id = extractCardActionChatId(event, root_context) orelse open_id orelse return result.items;
             const choice_text = extractCardActionText(allocator, event) orelse return result.items;
             defer allocator.free(choice_text);
 
@@ -198,7 +198,7 @@ pub const LarkChannel = struct {
                 .sender = try allocator.dupe(u8, chat_id),
                 .content = try allocator.dupe(u8, text),
                 .timestamp = root.nowEpochSecs(),
-                .is_group = true,
+                .is_group = extractCardActionIsGroup(event, root_context),
             });
             return result.toOwnedSlice(allocator);
         } else {
@@ -366,6 +366,35 @@ pub const LarkChannel = struct {
         return null;
     }
 
+    fn extractCardActionChatTypeField(value: std.json.Value) ?[]const u8 {
+        if (value != .object) return null;
+        const chat_type_val = value.object.get("chat_type") orelse return null;
+        if (chat_type_val != .string or chat_type_val.string.len == 0) return null;
+        return chat_type_val.string;
+    }
+
+    fn extractCardActionIsGroup(event: std.json.Value, root_context: ?std.json.Value) bool {
+        if (event != .object) return false;
+
+        if (event.object.get("context")) |context_val| {
+            if (extractCardActionChatTypeField(context_val)) |chat_type| {
+                return std.mem.eql(u8, chat_type, "group");
+            }
+        }
+
+        if (extractCardActionChatTypeField(event)) |chat_type| {
+            return std.mem.eql(u8, chat_type, "group");
+        }
+
+        if (root_context) |context_val| {
+            if (extractCardActionChatTypeField(context_val)) |chat_type| {
+                return std.mem.eql(u8, chat_type, "group");
+            }
+        }
+
+        return false;
+    }
+
     fn extractCardActionText(allocator: std.mem.Allocator, event: std.json.Value) ?[]u8 {
         if (event != .object) return null;
         const action_val = event.object.get("action") orelse return null;
@@ -493,11 +522,7 @@ pub const LarkChannel = struct {
         const event = parsed.value.object.get("event") orelse return null;
         if (event != .object) return null;
 
-        if (extractCardActionOpenId(event)) |open_id| {
-            if (!self.isUserAllowed(open_id)) return null;
-        } else if (!root.isAllowedExact(self.allow_from, "*")) {
-            return null;
-        }
+        if (!isCardActionAllowed(self, event)) return null;
 
         const choice_text = extractCardActionText(allocator, event) orelse return null;
         defer allocator.free(choice_text);
@@ -938,9 +963,9 @@ pub const LarkChannel = struct {
                 log.warn("lark websocket event handling failed: {}", .{err});
             };
 
-            var ack_buf: [16384]u8 = undefined;
             const elapsed_ms: u64 = @intCast(@max(std.time.milliTimestamp() - started_at_ms, 0));
-            const ack = buildLarkWsEventAckFrame(&ack_buf, frame, elapsed_ms, ack_payload) catch return;
+            const ack = buildLarkWsEventAckFrame(self.allocator, frame, elapsed_ms, ack_payload) catch return;
+            defer self.allocator.free(ack);
             ws.writeBinary(ack) catch |err| {
                 log.warn("lark websocket protobuf ack failed: {}", .{err});
             };
@@ -1454,6 +1479,13 @@ fn isCardActionPayload(payload: []const u8) bool {
     return isCardActionEventType(event_type_val.string);
 }
 
+fn isCardActionAllowed(self: *const LarkChannel, event: std.json.Value) bool {
+    if (LarkChannel.extractCardActionOpenId(event)) |open_id| {
+        return self.isUserAllowed(open_id);
+    }
+    return root.isAllowedExact(self.allow_from, "*");
+}
+
 fn buildLarkWsAckPayload(
     allocator: std.mem.Allocator,
     callback_response_json: ?[]const u8,
@@ -1487,13 +1519,14 @@ fn buildLarkWsPingFrame(buf: []u8, service_id: i32) ![]const u8 {
 }
 
 fn buildLarkWsEventAckFrame(
-    buf: []u8,
+    allocator: std.mem.Allocator,
     frame: LarkWsFrame,
     biz_rt_ms: u64,
     ack_payload: []const u8,
-) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const writer = fbs.writer();
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const writer = out.writer(allocator);
     try protoWriteU64(writer, 1, frame.seq_id);
     try protoWriteU64(writer, 2, frame.log_id);
     try protoWriteInt32(writer, 3, frame.service);
@@ -1516,7 +1549,7 @@ fn buildLarkWsEventAckFrame(
     if (frame.log_id_new) |log_id_new| {
         try protoWriteString(writer, 9, log_id_new);
     }
-    return fbs.getWritten();
+    return out.toOwnedSlice(allocator);
 }
 
 fn updatePingIntervalFromControlPayload(ping_interval_ms: *AtomicU32, payload: []const u8) void {
@@ -2300,8 +2333,13 @@ test "lark protobuf event ack preserves frame metadata" {
         .log_id_new = "log-new",
     };
 
-    var buf: [1024]u8 = undefined;
-    const encoded = try buildLarkWsEventAckFrame(&buf, src, 17, "{\"code\":200,\"headers\":null,\"data\":null}");
+    const encoded = try buildLarkWsEventAckFrame(
+        std.testing.allocator,
+        src,
+        17,
+        "{\"code\":200,\"headers\":null,\"data\":null}",
+    );
+    defer std.testing.allocator.free(encoded);
     var decoded = try decodeLarkWsFrame(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
 
@@ -2337,6 +2375,44 @@ test "lark websocket ack payload base64 encodes callback response" {
     defer allocator.free(decoded);
     try std.base64.standard.Decoder.decode(decoded, data_val.string);
     try std.testing.expectEqualStrings("{\"toast\":{\"type\":\"success\"}}", decoded);
+}
+
+test "lark protobuf event ack handles large callback payload" {
+    const allocator = std.testing.allocator;
+    const raw = try allocator.alloc(u8, 20_000);
+    defer allocator.free(raw);
+    @memset(raw, 'a');
+
+    const callback_response = try std.fmt.allocPrint(
+        allocator,
+        "{{\"toast\":{{\"type\":\"success\",\"content\":\"{s}\"}}}}",
+        .{raw},
+    );
+    defer allocator.free(callback_response);
+
+    const ack_payload = try buildLarkWsAckPayload(allocator, callback_response);
+    defer allocator.free(ack_payload);
+
+    const headers = [_]LarkWsHeader{
+        .{ .key = "type", .value = "event" },
+    };
+    const src = LarkWsFrame{
+        .seq_id = 1,
+        .log_id = 2,
+        .service = 3,
+        .method = LARK_WS_METHOD_DATA,
+        .headers = @constCast(headers[0..]),
+        .payload_encoding = "json",
+        .payload_type = "application/json",
+    };
+
+    const encoded = try buildLarkWsEventAckFrame(allocator, src, 99, ack_payload);
+    defer allocator.free(encoded);
+
+    var decoded = try decodeLarkWsFrame(allocator, encoded);
+    defer decoded.deinit(allocator);
+
+    try std.testing.expectEqualStrings(ack_payload, decoded.payload);
 }
 
 test "lark buildWebsocketPong handles empty timestamp" {
@@ -2484,7 +2560,7 @@ test "lark parse card action trigger emits choice message" {
     const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     const payload =
-        \\{"header":{"event_type":"card.action.trigger"},"event":{"operator":{"operator_id":{"open_id":"ou_user"}},"context":{"open_chat_id":"oc_chat_1"},"action":{"tag":"button","value":{"choice_id":"yes"}}}}
+        \\{"header":{"event_type":"card.action.trigger"},"event":{"operator":{"operator_id":{"open_id":"ou_user"}},"context":{"open_chat_id":"oc_chat_1","chat_type":"group"},"action":{"tag":"button","value":{"choice_id":"yes"}}}}
     ;
 
     const msgs = try ch.parseEventPayload(allocator, payload);
@@ -2525,6 +2601,30 @@ test "lark parse card action trigger_v1 reads submit text" {
     try std.testing.expectEqualStrings("confirm", msgs[0].content);
 }
 
+test "lark parse direct card action trigger keeps direct route" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"ou_user"};
+    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+
+    const payload =
+        \\{"header":{"event_type":"card.action.trigger"},"event":{"operator":{"operator_id":{"open_id":"ou_user"}},"context":{"open_chat_id":"oc_dm_1","chat_type":"p2p"},"action":{"tag":"button","value":{"choice_id":"yes"}}}}
+    ;
+
+    const msgs = try ch.parseEventPayload(allocator, payload);
+    defer {
+        for (msgs) |*m| {
+            var mm = m.*;
+            mm.deinit(allocator);
+        }
+        allocator.free(msgs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    try std.testing.expectEqualStrings("oc_dm_1", msgs[0].sender);
+    try std.testing.expectEqualStrings("yes", msgs[0].content);
+    try std.testing.expect(!msgs[0].is_group);
+}
+
 test "lark parse card action trigger reads form value" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"ou_user"};
@@ -2546,6 +2646,34 @@ test "lark parse card action trigger reads form value" {
     try std.testing.expectEqual(@as(usize, 1), msgs.len);
     try std.testing.expectEqualStrings("oc_chat_3", msgs[0].sender);
     try std.testing.expectEqualStrings("picked", msgs[0].content);
+}
+
+test "lark parse card action trigger without open id requires wildcard allowlist" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+
+    const payload =
+        \\{"header":{"event_type":"card.action.trigger"},"event":{"context":{"open_chat_id":"oc_chat_4","chat_type":"group"},"action":{"tag":"button","value":{"choice_id":"yes"}}}}
+    ;
+
+    const msgs = try ch.parseEventPayload(allocator, payload);
+    defer {
+        for (msgs) |*m| {
+            var mm = m.*;
+            mm.deinit(allocator);
+        }
+        allocator.free(msgs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    try std.testing.expectEqualStrings("oc_chat_4", msgs[0].sender);
+    try std.testing.expectEqualStrings("yes", msgs[0].content);
+    try std.testing.expect(msgs[0].is_group);
+
+    const response = (try ch.buildCardActionCallbackResponse(allocator, payload)).?;
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"toast\":{\"type\":\"success\"") != null);
 }
 
 test "lark build card action callback response returns raw card" {
