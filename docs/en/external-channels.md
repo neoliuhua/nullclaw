@@ -157,8 +157,6 @@ The plugin must respond with:
       "streaming": false,
       "send_rich": false,
       "typing": false,
-      "edit": false,
-      "delete": false,
       "reactions": false,
       "read_receipts": false
     }
@@ -182,10 +180,6 @@ Capability meanings:
   The plugin implements `send_rich`.
 - `typing`
   The plugin implements `start_typing` and `stop_typing`.
-- `edit`
-  The plugin implements `edit_message`.
-- `delete`
-  The plugin implements `delete_message`.
 - `reactions`
   The plugin implements `set_reaction`.
 - `read_receipts`
@@ -369,9 +363,9 @@ Attachment `kind` values:
 If `send_rich` is unsupported, leave the capability bit unset. The host may
 fall back to plain `send` only when the payload is simple enough.
 
-### `edit_message`
+### `set_reaction`
 
-Only used when `capabilities.edit=true`.
+Only used when `capabilities.reactions=true`.
 
 Host request:
 
@@ -379,7 +373,7 @@ Host request:
 {
   "jsonrpc": "2.0",
   "id": 7,
-  "method": "edit_message",
+  "method": "set_reaction",
   "params": {
     "runtime": {
       "name": "plugin_chat",
@@ -388,9 +382,7 @@ Host request:
     "message": {
       "target": "room-1",
       "message_id": "msg-42",
-      "text": "Updated text",
-      "attachments": [],
-      "choices": []
+      "emoji": "✅"
     }
   }
 }
@@ -404,14 +396,12 @@ Required success response:
 
 Rules:
 
-- `message.message_id` must identify the existing platform message to edit
-- payload fields follow the same schema as `send_rich`
-- if the plugin only supports text edits, it should reject unsupported
-  attachments/choices instead of pretending success
+- `emoji` must be a string to set/update a reaction
+- `emoji: null` means clear the reaction for that message
 
-### `delete_message`
+### `mark_read`
 
-Only used when `capabilities.delete=true`.
+Only used when `capabilities.read_receipts=true`.
 
 Host request:
 
@@ -419,7 +409,7 @@ Host request:
 {
   "jsonrpc": "2.0",
   "id": 8,
-  "method": "delete_message",
+  "method": "mark_read",
   "params": {
     "runtime": {
       "name": "plugin_chat",
@@ -439,72 +429,6 @@ Required success response:
 {"jsonrpc":"2.0","id":8,"result":{"accepted":true}}
 ```
 
-### `set_reaction`
-
-Only used when `capabilities.reactions=true`.
-
-Host request:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 9,
-  "method": "set_reaction",
-  "params": {
-    "runtime": {
-      "name": "plugin_chat",
-      "account_id": "main"
-    },
-    "message": {
-      "target": "room-1",
-      "message_id": "msg-42",
-      "emoji": "✅"
-    }
-  }
-}
-```
-
-Required success response:
-
-```json
-{"jsonrpc":"2.0","id":9,"result":{"accepted":true}}
-```
-
-Rules:
-
-- `emoji` must be a string to set/update a reaction
-- `emoji: null` means clear the reaction for that message
-
-### `mark_read`
-
-Only used when `capabilities.read_receipts=true`.
-
-Host request:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 10,
-  "method": "mark_read",
-  "params": {
-    "runtime": {
-      "name": "plugin_chat",
-      "account_id": "main"
-    },
-    "message": {
-      "target": "room-1",
-      "message_id": "msg-42"
-    }
-  }
-}
-```
-
-Required success response:
-
-```json
-{"jsonrpc":"2.0","id":10,"result":{"accepted":true}}
-```
-
 ### Typing RPCs
 
 Only used when `capabilities.typing=true`.
@@ -512,11 +436,11 @@ Only used when `capabilities.typing=true`.
 Requests:
 
 ```json
-{"jsonrpc":"2.0","id":11,"method":"start_typing","params":{"runtime":{"name":"plugin_chat","account_id":"main"},"recipient":"room-1"}}
+{"jsonrpc":"2.0","id":9,"method":"start_typing","params":{"runtime":{"name":"plugin_chat","account_id":"main"},"recipient":"room-1"}}
 ```
 
 ```json
-{"jsonrpc":"2.0","id":12,"method":"stop_typing","params":{"runtime":{"name":"plugin_chat","account_id":"main"},"recipient":"room-1"}}
+{"jsonrpc":"2.0","id":10,"method":"stop_typing","params":{"runtime":{"name":"plugin_chat","account_id":"main"},"recipient":"room-1"}}
 ```
 
 Required success response:

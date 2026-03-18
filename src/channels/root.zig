@@ -71,11 +71,6 @@ pub const Channel = struct {
         target: []const u8,
         message_id: []const u8,
     };
-    pub const MessageEdit = struct {
-        target: []const u8,
-        message_id: []const u8,
-        payload: OutboundPayload,
-    };
     pub const ReactionUpdate = struct {
         target: []const u8,
         message_id: []const u8,
@@ -84,12 +79,6 @@ pub const Channel = struct {
 
     fn defaultStartTyping(_: *anyopaque, _: []const u8) anyerror!void {}
     fn defaultStopTyping(_: *anyopaque, _: []const u8) anyerror!void {}
-    fn defaultEditMessage(_: *anyopaque, _: MessageEdit) anyerror!void {
-        return error.NotSupported;
-    }
-    fn defaultDeleteMessage(_: *anyopaque, _: MessageRef) anyerror!void {
-        return error.NotSupported;
-    }
     fn defaultSetReaction(_: *anyopaque, _: ReactionUpdate) anyerror!void {
         return error.NotSupported;
     }
@@ -131,10 +120,6 @@ pub const Channel = struct {
         startTyping: *const fn (ptr: *anyopaque, recipient: []const u8) anyerror!void = &defaultStartTyping,
         /// Stop processing indicator for a recipient.
         stopTyping: *const fn (ptr: *anyopaque, recipient: []const u8) anyerror!void = &defaultStopTyping,
-        /// Edit an already-sent message in-place.
-        editMessage: *const fn (ptr: *anyopaque, edit: MessageEdit) anyerror!void = &defaultEditMessage,
-        /// Delete an existing message from the target conversation.
-        deleteMessage: *const fn (ptr: *anyopaque, message_ref: MessageRef) anyerror!void = &defaultDeleteMessage,
         /// Set or clear a reaction on an existing message. `emoji=null` clears it.
         setReaction: *const fn (ptr: *anyopaque, update: ReactionUpdate) anyerror!void = &defaultSetReaction,
         /// Mark the referenced message as read.
@@ -186,14 +171,6 @@ pub const Channel = struct {
 
     pub fn stopTyping(self: Channel, recipient: []const u8) !void {
         return self.vtable.stopTyping(self.ptr, recipient);
-    }
-
-    pub fn editMessage(self: Channel, edit: MessageEdit) !void {
-        return self.vtable.editMessage(self.ptr, edit);
-    }
-
-    pub fn deleteMessage(self: Channel, message_ref: MessageRef) !void {
-        return self.vtable.deleteMessage(self.ptr, message_ref);
     }
 
     pub fn setReaction(self: Channel, update: ReactionUpdate) !void {
@@ -907,15 +884,6 @@ test "Channel message operations default to not supported" {
     var mock = Mock{};
     const channel = Channel{ .ptr = @ptrCast(&mock), .vtable = &Mock.vtable };
 
-    try std.testing.expectError(error.NotSupported, channel.editMessage(.{
-        .target = "chat-1",
-        .message_id = "m-1",
-        .payload = .{ .text = "updated" },
-    }));
-    try std.testing.expectError(error.NotSupported, channel.deleteMessage(.{
-        .target = "chat-1",
-        .message_id = "m-1",
-    }));
     try std.testing.expectError(error.NotSupported, channel.setReaction(.{
         .target = "chat-1",
         .message_id = "m-1",
@@ -929,13 +897,10 @@ test "Channel message operations default to not supported" {
 
 test "Channel message operations dispatch through vtable" {
     const Mock = struct {
-        edit_target: ?[]const u8 = null,
-        edit_message_id: ?[]const u8 = null,
-        edit_text: ?[]const u8 = null,
-        delete_target: ?[]const u8 = null,
-        delete_message_id: ?[]const u8 = null,
+        reaction_target: ?[]const u8 = null,
         reaction_message_id: ?[]const u8 = null,
         reaction_emoji: ??[]const u8 = null,
+        read_target: ?[]const u8 = null,
         read_message_id: ?[]const u8 = null,
 
         fn start(_: *anyopaque) anyerror!void {}
@@ -947,24 +912,15 @@ test "Channel message operations dispatch through vtable" {
         fn health(_: *anyopaque) bool {
             return true;
         }
-        fn editMessage(ptr: *anyopaque, edit: Channel.MessageEdit) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.edit_target = edit.target;
-            self.edit_message_id = edit.message_id;
-            self.edit_text = edit.payload.text;
-        }
-        fn deleteMessage(ptr: *anyopaque, message_ref: Channel.MessageRef) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.delete_target = message_ref.target;
-            self.delete_message_id = message_ref.message_id;
-        }
         fn setReaction(ptr: *anyopaque, update: Channel.ReactionUpdate) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reaction_target = update.target;
             self.reaction_message_id = update.message_id;
             self.reaction_emoji = update.emoji;
         }
         fn markRead(ptr: *anyopaque, message_ref: Channel.MessageRef) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.read_target = message_ref.target;
             self.read_message_id = message_ref.message_id;
         }
 
@@ -974,8 +930,6 @@ test "Channel message operations dispatch through vtable" {
             .send = &send,
             .name = &name,
             .healthCheck = &health,
-            .editMessage = &editMessage,
-            .deleteMessage = &deleteMessage,
             .setReaction = &setReaction,
             .markRead = &markRead,
         };
@@ -984,33 +938,21 @@ test "Channel message operations dispatch through vtable" {
     var mock = Mock{};
     const channel = Channel{ .ptr = @ptrCast(&mock), .vtable = &Mock.vtable };
 
-    try channel.editMessage(.{
-        .target = "chat-2",
-        .message_id = "m-2",
-        .payload = .{ .text = "updated" },
-    });
-    try channel.deleteMessage(.{
-        .target = "chat-2",
-        .message_id = "m-3",
-    });
     try channel.setReaction(.{
         .target = "chat-2",
-        .message_id = "m-4",
+        .message_id = "m-2",
         .emoji = "done",
     });
     try channel.markRead(.{
         .target = "chat-2",
-        .message_id = "m-5",
+        .message_id = "m-3",
     });
 
-    try std.testing.expectEqualStrings("chat-2", mock.edit_target.?);
-    try std.testing.expectEqualStrings("m-2", mock.edit_message_id.?);
-    try std.testing.expectEqualStrings("updated", mock.edit_text.?);
-    try std.testing.expectEqualStrings("chat-2", mock.delete_target.?);
-    try std.testing.expectEqualStrings("m-3", mock.delete_message_id.?);
-    try std.testing.expectEqualStrings("m-4", mock.reaction_message_id.?);
+    try std.testing.expectEqualStrings("chat-2", mock.reaction_target.?);
+    try std.testing.expectEqualStrings("m-2", mock.reaction_message_id.?);
     try std.testing.expectEqualStrings("done", mock.reaction_emoji.?.?);
-    try std.testing.expectEqualStrings("m-5", mock.read_message_id.?);
+    try std.testing.expectEqualStrings("chat-2", mock.read_target.?);
+    try std.testing.expectEqualStrings("m-3", mock.read_message_id.?);
 }
 
 test {

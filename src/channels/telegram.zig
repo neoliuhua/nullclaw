@@ -1064,11 +1064,15 @@ pub const TelegramChannel = struct {
     }
 
     pub fn setTaskReaction(self: *TelegramChannel, target: []const u8, message_id: ?i64, reaction: TaskReaction) void {
-        if (builtin.is_test or !self.status_reactions_enabled) return;
+        if (!self.status_reactions_enabled or target.len == 0) return;
         const msg_id = message_id orelse return;
-        if (target.len == 0) return;
-        const parsed_target = parseTelegramTarget(target);
-        self.api().setMessageReaction(parsed_target.chat_id, msg_id, self.taskReactionEmoji(reaction)) catch |err| {
+        var message_id_buf: [32]u8 = undefined;
+        const message_id_text = std.fmt.bufPrint(&message_id_buf, "{d}", .{msg_id}) catch return;
+        self.channel().setReaction(.{
+            .target = target,
+            .message_id = message_id_text,
+            .emoji = self.taskReactionEmoji(reaction),
+        }) catch |err| {
             log.debug("telegram setMessageReaction failed: {}", .{err});
         };
     }
@@ -1081,6 +1085,16 @@ pub const TelegramChannel = struct {
             .failed => self.reaction_emojis.failed,
         };
         return if (emoji.len == 0) null else emoji;
+    }
+
+    fn setReaction(self: *TelegramChannel, update: root.Channel.ReactionUpdate) !void {
+        if (update.target.len == 0 or update.message_id.len == 0) return error.InvalidMessageRef;
+        const msg_id = std.fmt.parseInt(i64, update.message_id, 10) catch return error.InvalidMessageRef;
+        if (!self.status_reactions_enabled) return error.NotSupported;
+        if (builtin.is_test) return;
+
+        const parsed_target = parseTelegramTarget(update.target);
+        try self.api().setMessageReaction(parsed_target.chat_id, msg_id, update.emoji);
     }
 
     pub fn createForumTopicFromTarget(self: *TelegramChannel, target: []const u8, name: []const u8) !i64 {
@@ -3015,6 +3029,11 @@ pub const TelegramChannel = struct {
         try self.stopTyping(recipient);
     }
 
+    fn vtableSetReaction(ptr: *anyopaque, update: root.Channel.ReactionUpdate) anyerror!void {
+        const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        try self.setReaction(update);
+    }
+
     fn vtableSupportsStreamingOutbound(ptr: *anyopaque) bool {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
         return self.streaming_enabled;
@@ -3030,6 +3049,7 @@ pub const TelegramChannel = struct {
         .healthCheck = &vtableHealthCheck,
         .startTyping = &vtableStartTyping,
         .stopTyping = &vtableStopTyping,
+        .setReaction = &vtableSetReaction,
         .supportsStreamingOutbound = &vtableSupportsStreamingOutbound,
     };
 
@@ -4017,6 +4037,16 @@ test "telegram stopTyping is idempotent" {
     var ch = TelegramChannel.init(std.testing.allocator, "tok", &.{}, &.{}, "allowlist");
     try ch.stopTyping("12345");
     try ch.stopTyping("12345");
+}
+
+test "telegram channel setReaction rejects invalid message ids" {
+    var ch = TelegramChannel.init(std.testing.allocator, "tok", &.{}, &.{}, "allowlist");
+    ch.status_reactions_enabled = true;
+    try std.testing.expectError(error.InvalidMessageRef, ch.channel().setReaction(.{
+        .target = "12345",
+        .message_id = "bad-id",
+        .emoji = "✅",
+    }));
 }
 
 // ════════════════════════════════════════════════════════════════════════════

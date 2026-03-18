@@ -723,6 +723,29 @@ fn resolveOutboundChannel(
         registry.findByName(channel_name);
 }
 
+fn buildInboundMessageRef(
+    msg: *const bus_mod.InboundMessage,
+    meta: channel_adapters.InboundMetadata,
+) ?channels_mod.Channel.MessageRef {
+    const message_id = meta.message_id orelse return null;
+    if (msg.chat_id.len == 0 or message_id.len == 0) return null;
+    return .{
+        .target = msg.chat_id,
+        .message_id = message_id,
+    };
+}
+
+fn markInboundMessageRead(
+    channel: channels_mod.Channel,
+    message_ref: ?channels_mod.Channel.MessageRef,
+) void {
+    const ref = message_ref orelse return;
+    channel.markRead(ref) catch |err| switch (err) {
+        error.NotSupported => {},
+        else => log.debug("inbound markRead failed: {}", .{err}),
+    };
+}
+
 fn sendInboundProcessingIndicator(
     allocator: std.mem.Allocator,
     registry: *const dispatch.ChannelRegistry,
@@ -865,6 +888,9 @@ fn inboundDispatcherThread(
         );
 
         const outbound_channel = resolveOutboundChannel(registry, msg.channel, outbound_account_id);
+        if (outbound_channel) |channel| {
+            markInboundMessageRead(channel, buildInboundMessageRef(&msg, parsed_meta.fields));
+        }
         const use_streaming_outbound = if (outbound_channel) |channel|
             channel.supportsStreamingOutbound()
         else
@@ -2178,6 +2204,60 @@ test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" 
     }, "C123");
     try std.testing.expect(with_message_only != null);
     try std.testing.expectEqualStrings("1700.1", with_message_only.?.thread_ts);
+}
+
+test "buildInboundMessageRef uses inbound chat target and metadata message id" {
+    const msg = bus_mod.InboundMessage{
+        .channel = "external",
+        .sender_id = "user-1",
+        .chat_id = "room-9",
+        .content = "hello",
+        .session_key = "external:room-9",
+    };
+    const message_ref = buildInboundMessageRef(&msg, .{ .message_id = "msg-42" }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("room-9", message_ref.target);
+    try std.testing.expectEqualStrings("msg-42", message_ref.message_id);
+}
+
+test "markInboundMessageRead dispatches through channel vtable" {
+    const Mock = struct {
+        target: ?[]const u8 = null,
+        message_id: ?[]const u8 = null,
+
+        fn start(_: *anyopaque) anyerror!void {}
+        fn stop(_: *anyopaque) void {}
+        fn send(_: *anyopaque, _: []const u8, _: []const u8, _: []const []const u8) anyerror!void {}
+        fn name(_: *anyopaque) []const u8 {
+            return "mock";
+        }
+        fn mockHealth(_: *anyopaque) bool {
+            return true;
+        }
+        fn markRead(ptr: *anyopaque, message_ref: channels_mod.Channel.MessageRef) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.target = message_ref.target;
+            self.message_id = message_ref.message_id;
+        }
+
+        const vtable = channels_mod.Channel.VTable{
+            .start = &start,
+            .stop = &stop,
+            .send = &send,
+            .name = &name,
+            .healthCheck = &mockHealth,
+            .markRead = &markRead,
+        };
+    };
+
+    var mock = Mock{};
+    const channel = channels_mod.Channel{ .ptr = @ptrCast(&mock), .vtable = &Mock.vtable };
+    markInboundMessageRead(channel, .{
+        .target = "room-9",
+        .message_id = "msg-42",
+    });
+
+    try std.testing.expectEqualStrings("room-9", mock.target.?);
+    try std.testing.expectEqualStrings("msg-42", mock.message_id.?);
 }
 
 test "hasSupervisedChannels true for nostr" {

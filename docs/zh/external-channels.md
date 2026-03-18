@@ -153,8 +153,6 @@ host 会先发：
       "streaming": false,
       "send_rich": false,
       "typing": false,
-      "edit": false,
-      "delete": false,
       "reactions": false,
       "read_receipts": false
     }
@@ -178,10 +176,6 @@ Capability 含义：
   插件实现了 `send_rich`。
 - `typing`
   插件实现了 `start_typing` 和 `stop_typing`。
-- `edit`
-  插件实现了 `edit_message`。
-- `delete`
-  插件实现了 `delete_message`。
 - `reactions`
   插件实现了 `set_reaction`。
 - `read_receipts`
@@ -362,9 +356,9 @@ Host 请求：
 
 如果不支持 `send_rich`，就不要声明 capability。只有在 payload 足够简单时，host 才可能退化为普通 `send`。
 
-### `edit_message`
+### `set_reaction`
 
-只有在 `capabilities.edit=true` 时才会调用。
+只有在 `capabilities.reactions=true` 时才会调用。
 
 Host 请求：
 
@@ -372,7 +366,7 @@ Host 请求：
 {
   "jsonrpc": "2.0",
   "id": 7,
-  "method": "edit_message",
+  "method": "set_reaction",
   "params": {
     "runtime": {
       "name": "plugin_chat",
@@ -381,9 +375,7 @@ Host 请求：
     "message": {
       "target": "room-1",
       "message_id": "msg-42",
-      "text": "Updated text",
-      "attachments": [],
-      "choices": []
+      "emoji": "✅"
     }
   }
 }
@@ -397,13 +389,12 @@ Host 请求：
 
 规则：
 
-- `message.message_id` 必须能唯一标识要编辑的已有平台消息
-- payload 字段和 `send_rich` 使用同一套 schema
-- 如果插件只支持纯文本编辑，就应该拒绝不支持的 attachments/choices，而不是伪造成功
+- `emoji` 为字符串时表示设置或更新 reaction
+- `emoji: null` 表示清除这个消息上的 reaction
 
-### `delete_message`
+### `mark_read`
 
-只有在 `capabilities.delete=true` 时才会调用。
+只有在 `capabilities.read_receipts=true` 时才会调用。
 
 Host 请求：
 
@@ -411,7 +402,7 @@ Host 请求：
 {
   "jsonrpc": "2.0",
   "id": 8,
-  "method": "delete_message",
+  "method": "mark_read",
   "params": {
     "runtime": {
       "name": "plugin_chat",
@@ -431,72 +422,6 @@ Host 请求：
 {"jsonrpc":"2.0","id":8,"result":{"accepted":true}}
 ```
 
-### `set_reaction`
-
-只有在 `capabilities.reactions=true` 时才会调用。
-
-Host 请求：
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 9,
-  "method": "set_reaction",
-  "params": {
-    "runtime": {
-      "name": "plugin_chat",
-      "account_id": "main"
-    },
-    "message": {
-      "target": "room-1",
-      "message_id": "msg-42",
-      "emoji": "✅"
-    }
-  }
-}
-```
-
-必须返回：
-
-```json
-{"jsonrpc":"2.0","id":9,"result":{"accepted":true}}
-```
-
-规则：
-
-- `emoji` 为字符串时表示设置或更新 reaction
-- `emoji: null` 表示清除这个消息上的 reaction
-
-### `mark_read`
-
-只有在 `capabilities.read_receipts=true` 时才会调用。
-
-Host 请求：
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 10,
-  "method": "mark_read",
-  "params": {
-    "runtime": {
-      "name": "plugin_chat",
-      "account_id": "main"
-    },
-    "message": {
-      "target": "room-1",
-      "message_id": "msg-42"
-    }
-  }
-}
-```
-
-必须返回：
-
-```json
-{"jsonrpc":"2.0","id":10,"result":{"accepted":true}}
-```
-
 ### Typing RPC
 
 只有在 `capabilities.typing=true` 时才会调用。
@@ -504,11 +429,11 @@ Host 请求：
 请求：
 
 ```json
-{"jsonrpc":"2.0","id":11,"method":"start_typing","params":{"runtime":{"name":"plugin_chat","account_id":"main"},"recipient":"room-1"}}
+{"jsonrpc":"2.0","id":9,"method":"start_typing","params":{"runtime":{"name":"plugin_chat","account_id":"main"},"recipient":"room-1"}}
 ```
 
 ```json
-{"jsonrpc":"2.0","id":12,"method":"stop_typing","params":{"runtime":{"name":"plugin_chat","account_id":"main"},"recipient":"room-1"}}
+{"jsonrpc":"2.0","id":10,"method":"stop_typing","params":{"runtime":{"name":"plugin_chat","account_id":"main"},"recipient":"room-1"}}
 ```
 
 必须返回：

@@ -74,8 +74,6 @@ Typical next steps:
    - `capabilities.streaming`
    - `capabilities.send_rich`
    - `capabilities.typing`
-   - `capabilities.edit`
-   - `capabilities.delete`
    - `capabilities.reactions`
    - `capabilities.read_receipts`
 
@@ -87,8 +85,7 @@ Typical next steps:
 - accepted outbound actions must return `{"accepted": true}`
 - if you emit inbound messages, include `peer_kind` and `peer_id` in metadata
   whenever routing/session separation matters
-- optional message action RPCs are `edit_message`, `delete_message`,
-  `set_reaction`, and `mark_read`
+- optional message action RPCs are `set_reaction` and `mark_read`
 
 For the full protocol contract, see:
 
