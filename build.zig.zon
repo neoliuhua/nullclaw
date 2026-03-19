@@ -11,12 +11,16 @@
             .url = "git+https://github.com/nullclaw/websocket#2e47d59d73a36f9b30c3239153ca9f7282f74827",
             .hash = "websocket-0.1.0-ZPISdWh4AwABFRThxTMh3IgIK04ifiJC__ztQIGgOSoO",
         },
+        .dvui = .{
+            .path = "dvui",
+        },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
         "vendor",
+        "dvui",
         "LICENSE",
     },
 }

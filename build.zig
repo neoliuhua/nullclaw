@@ -559,6 +559,41 @@ pub fn build(b: *std.Build) void {
         b.default_step = &strip_cmd.step;
     }
 
+    // ---------- desktop GUI step ----------
+    // Build: zig build desktop
+    // Requires dvui at ./dvui (local path dep) and SDL3.
+    // Linux: apt install libsdl3-dev  |  macOS: brew install sdl3
+    // Windows: SDL3 compiled from source via dvui's lazy sdl3 dep.
+    //
+    // b.lazyImport lets us read dvui's exported Backend enum without
+    // causing a duplicate-module error (Zig 0.15 build system pattern).
+    if (b.lazyImport(@This(), "dvui")) |DvuiBuild| {
+        const dvui_dep = b.dependency("dvui", .{
+            .target = target,
+            .optimize = optimize,
+            .backend = DvuiBuild.Backend.sdl3,
+        });
+        const dvui_mod = dvui_dep.module("dvui_sdl3");
+        const sdl_backend_mod = dvui_dep.module("sdl3");
+
+        const desktop_exe = b.addExecutable(.{
+            .name = "nullclaw-desktop",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main_desktop.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        desktop_exe.root_module.addImport("dvui", dvui_mod);
+        desktop_exe.root_module.addImport("sdl-backend", sdl_backend_mod);
+
+        const desktop_step = b.step("desktop", "Build and run the desktop GUI");
+        const desktop_install = b.addInstallArtifact(desktop_exe, .{});
+        const desktop_run = b.addRunArtifact(desktop_exe);
+        desktop_run.step.dependOn(&desktop_install.step);
+        desktop_step.dependOn(&desktop_run.step);
+    }
+
     // ---------- run step ----------
     const run_step = b.step("run", "Run nullclaw");
     const run_cmd = b.addRunArtifact(exe);
